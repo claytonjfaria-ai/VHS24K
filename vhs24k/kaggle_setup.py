@@ -95,6 +95,8 @@ def setup_kaggle_environment(realesrgan_dir: str | pathlib.Path = "/kaggle/worki
         if not dest.exists():
             urllib.request.urlretrieve(url, dest)
 
+    import importlib
+    importlib.invalidate_caches()
     import basicsr  # noqa: F401
     import gfpgan  # noqa: F401
     import realesrgan  # noqa: F401
