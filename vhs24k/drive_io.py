@@ -99,28 +99,30 @@ def download_wedding_files(
         return [dest_dir / name for name in selected if (dest_dir / name).exists()]
 
     if transfer_method == "gdown":
-        try:
-            import gdown  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise ImportError(
-                "gdown is not installed. Install it with 'pip install gdown'."
-            ) from exc
+        import urllib.request
 
         downloaded: list[Path] = []
         for filename, file_id in selected.items():
             out_path = dest_dir / filename
-            if out_path.exists() and out_path.stat().st_size > 0:
-                logger.info("Skipping existing file: %s", out_path)
+            if out_path.exists() and out_path.stat().st_size > 1_000_000:
+                print(f"Skipping existing file: {out_path.name} ({out_path.stat().st_size // 1_000_000} MB)")
                 downloaded.append(out_path)
                 continue
 
-            url = f"https://drive.google.com/uc?id={file_id}"
-            result = gdown.download(url=url, output=str(out_path), quiet=False)
-            if not result or not out_path.exists():
+            direct_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            print(f"Downloading {filename} from Google Drive...")
+            urllib.request.urlretrieve(direct_url, out_path)
+
+            if not out_path.exists() or out_path.stat().st_size < 1_000_000:
+                import gdown  # type: ignore[import-not-found]
+                gdown.download(id=file_id, output=str(out_path), quiet=False)
+
+            if not out_path.exists() or out_path.stat().st_size < 1_000_000:
                 raise RuntimeError(
-                    f"gdown failed to download {filename} (id={file_id}). "
-                    "Ensure the file is link-shared or use method='rclone'."
+                    f"Failed to download {filename} (id={file_id}). "
+                    "Ensure the Wedding folder is link-shared."
                 )
+            print(f"Downloaded {filename} ({out_path.stat().st_size // 1_000_000} MB)")
             downloaded.append(out_path)
         return downloaded
 
