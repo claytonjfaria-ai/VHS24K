@@ -314,7 +314,9 @@ def process_chunk(args: argparse.Namespace) -> Path:
             apply_post_upscale_4k_camera_polish,
             apply_pre_upscale_color_and_lighting,
             closed_loop_review_and_refine,
+            remove_vhs_white_line_dropouts,
             save_comparison_and_report,
+            temporal_smooth_4k_frame,
         )
 
         recipe, crop_box = _sample_chunk_metrics(input_path, total_frames, args.face_weight)
@@ -333,18 +335,31 @@ def process_chunk(args: argparse.Namespace) -> Path:
     rep_idx = min(15, max(0, total_frames // 2)) if total_frames > 0 else 0
     reviewed = False
     frame_idx = 0
+    total_dropouts_fixed = 0
+    prev_4k_frame: Any | None = None
+
+    def _read_cropped() -> Any | None:
+        ok, frm = cap.read()
+        if not ok or frm is None:
+            return None
+        if args.quality_review and recipe is not None:
+            return apply_overscan_crop(frm, crop_box)
+        return frm
 
     try:
-        while True:
-            ok, raw_frame = cap.read()
-            if not ok or raw_frame is None:
-                break
+        prev_raw: Any | None = None
+        curr_raw = _read_cropped()
+        next_raw = _read_cropped() if curr_raw is not None else None
 
+        while curr_raw is not None:
             if args.quality_review and recipe is not None:
-                raw_frame = apply_overscan_crop(raw_frame, crop_box)
-                pre_frame = apply_pre_upscale_color_and_lighting(raw_frame, recipe)
+                clean_raw, n_dropouts = remove_vhs_white_line_dropouts(
+                    curr_raw, prev_raw, next_raw
+                )
+                total_dropouts_fixed += n_dropouts
+                pre_frame = apply_pre_upscale_color_and_lighting(clean_raw, recipe)
             else:
-                pre_frame = raw_frame
+                pre_frame = curr_raw
 
             if face_enhancer is not None:
                 weight = float(getattr(recipe, "face_weight", args.face_weight)) if recipe is not None else args.face_weight
@@ -368,13 +383,13 @@ def process_chunk(args: argparse.Namespace) -> Path:
                         recipe,
                         was_refined,
                     ) = closed_loop_review_and_refine(
-                        raw_frame,
+                        curr_raw,
                         post_frame,
                         recipe,
                         target_score=args.target_quality_score,
                     )
                     saved = save_comparison_and_report(
-                        raw_frame,
+                        curr_raw,
                         post_frame,
                         before_metrics,
                         after_metrics,
@@ -389,14 +404,20 @@ def process_chunk(args: argparse.Namespace) -> Path:
                         f"After={after_metrics.overall_score:.1f}/100 "
                         f"({after_metrics.grade}) | "
                         f"Auto-Refined={was_refined} | "
+                        f"Dropouts fixed={total_dropouts_fixed} px | "
                         f"Report={saved.get('report_json')}",
                         flush=True,
                     )
                     reviewed = True
+                post_frame = temporal_smooth_4k_frame(post_frame, prev_4k_frame, strength=0.30)
+                prev_4k_frame = post_frame
             else:
                 post_frame = upscaled_frame
 
             ffmpeg_proc.stdin.write(post_frame.tobytes())
+            prev_raw = curr_raw
+            curr_raw = next_raw
+            next_raw = _read_cropped() if curr_raw is not None else None
             frame_idx += 1
 
         ffmpeg_proc.stdin.close()
@@ -411,7 +432,12 @@ def process_chunk(args: argparse.Namespace) -> Path:
             ffmpeg_proc.kill()
             ffmpeg_proc.wait()
 
-    logger.info("Processed %d frames -> %s", frame_idx, output_file)
+    logger.info(
+        "Processed %d frames (Dropouts fixed=%d px) -> %s",
+        frame_idx,
+        total_dropouts_fixed,
+        output_file,
+    )
     return output_file
 
 

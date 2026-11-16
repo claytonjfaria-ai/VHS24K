@@ -30,7 +30,9 @@ from vhs24k.quality_review import (
     closed_loop_review_and_refine,
     compute_safe_overscan_crop,
     derive_enhancement_recipe,
+    remove_vhs_white_line_dropouts,
     save_comparison_and_report,
+    temporal_smooth_4k_frame,
 )
 from vhs24k.upscale import (
     build_enhancer_worker_cmd,
@@ -175,7 +177,10 @@ class TestFilters:
         )
         assert (
             build_deinterlace_denoise_filter(cfg_bwdif)
-            == "bwdif=mode=0:parity=auto:deint=all,hqdn3d=0.36:0.7:0.9:0.9"
+            == "bwdif=mode=0:parity=auto:deint=all,"
+            "atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08,"
+            "deflicker=size=5:mode=am,"
+            "hqdn3d=0.36:0.7:0.9:0.9"
         )
 
         cfg_yadif = PipelineConfig(
@@ -696,3 +701,39 @@ class TestQualityReview:
         assert ch % 2 == 0 and cw % 2 == 0
         assert ch < h and cw < w
         assert apply_overscan_crop(frame, None).shape == frame.shape
+
+    def test_remove_vhs_white_line_dropouts(self) -> None:
+        h, w = 80, 160
+        prev_bgr = np.full((h, w, 3), 90, dtype=np.uint8)
+        next_bgr = np.full((h, w, 3), 90, dtype=np.uint8)
+        curr_bgr = np.full((h, w, 3), 90, dtype=np.uint8)
+
+        # Clean frame should report zero dropouts
+        clean_out, n_clean = remove_vhs_white_line_dropouts(curr_bgr, prev_bgr, next_bgr)
+        assert n_clean == 0
+        assert np.array_equal(clean_out, curr_bgr)
+
+        # Inject a bright horizontal white VHS tape dropout line
+        curr_bgr[30, 20:140, :] = 255
+        fixed_bgr, n_dropouts = remove_vhs_white_line_dropouts(curr_bgr, prev_bgr, next_bgr)
+        assert n_dropouts > 0
+        assert fixed_bgr.shape == curr_bgr.shape
+        assert fixed_bgr.dtype == np.uint8
+        assert float(np.mean(fixed_bgr[30, 20:140, :])) < 110.0
+
+    def test_temporal_smooth_4k_frame(self) -> None:
+        h, w = 64, 64
+        prev_4k = np.full((h, w, 3), 100, dtype=np.uint8)
+        curr_4k = np.full((h, w, 3), 104, dtype=np.uint8)  # small stationary micro-shimmer (diff=4)
+        curr_4k[16:32, 16:32, :] = 220  # fast-moving bright edge (diff=120)
+
+        # First frame (prev=None) passes through unchanged
+        assert np.array_equal(temporal_smooth_4k_frame(curr_4k, None, strength=0.30), curr_4k)
+
+        smoothed = temporal_smooth_4k_frame(curr_4k, prev_4k, strength=0.30)
+        assert smoothed.shape == curr_4k.shape
+        assert smoothed.dtype == np.uint8
+        # Stationary shimmer is pulled toward prev_4k (100 < value < 104)
+        assert int(smoothed[0, 0, 0]) < 104
+        # Fast-moving edge is preserved without ghosting
+        assert int(smoothed[24, 24, 0]) == 220

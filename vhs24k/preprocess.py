@@ -195,6 +195,8 @@ def build_deinterlace_denoise_filter(cfg: PipelineConfig) -> str:
         raise ValueError(f"Unsupported deinterlace mode: {cfg.deinterlace!r}")
 
     if cfg.denoise_strength > 0.0:
+        filters.append("atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08")
+        filters.append("deflicker=size=5:mode=am")
         s = cfg.denoise_strength
         luma_s = round(1.8 * s, 2)
         chroma_s = round(3.5 * s, 2)

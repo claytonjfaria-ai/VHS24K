@@ -764,3 +764,111 @@ def save_comparison_and_report(
         saved["comparison_jpg"] = str(jpg_path)
 
     return saved
+
+
+def remove_vhs_white_line_dropouts(
+    curr_bgr: np.ndarray,
+    prev_bgr: np.ndarray | None = None,
+    next_bgr: np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    """Detect and inpaint horizontal white/bright VHS tape dropout streaks."""
+    curr_bgr = _validate_bgr_frame(curr_bgr)
+    h, w = curr_bgr.shape[:2]
+    if h < 3 or w < 3:
+        return curr_bgr.copy(), 0
+
+    y = _bgr_to_luma(curr_bgr)
+    y_vert = 0.5 * (
+        np.pad(y[:-1, :], ((1, 0), (0, 0)), mode="edge")
+        + np.pad(y[1:, :], ((0, 1), (0, 0)), mode="edge")
+    )
+    y_vert2 = 0.5 * (
+        np.pad(y[:-2, :], ((2, 0), (0, 0)), mode="edge")
+        + np.pad(y[2:, :], ((0, 2), (0, 0)), mode="edge")
+    )
+    vert_spike = np.maximum(y - y_vert, y - y_vert2)
+
+    valid_prev = prev_bgr is not None and prev_bgr.shape == curr_bgr.shape
+    valid_next = next_bgr is not None and next_bgr.shape == curr_bgr.shape
+
+    ref_bgr: np.ndarray | None = None
+    low_motion: np.ndarray | None = None
+
+    if valid_prev or valid_next:
+        if valid_prev and valid_next:
+            p_v = _validate_bgr_frame(prev_bgr)  # type: ignore[arg-type]
+            n_v = _validate_bgr_frame(next_bgr)  # type: ignore[arg-type]
+            y_prev = _bgr_to_luma(p_v)
+            y_next = _bgr_to_luma(n_v)
+            ref_bgr = 0.5 * (p_v.astype(np.float32) + n_v.astype(np.float32))
+            y_temp_max = np.maximum(y_prev, y_next)
+            low_motion = np.abs(y_prev - y_next) < 25.0
+        elif valid_prev:
+            p_v = _validate_bgr_frame(prev_bgr)  # type: ignore[arg-type]
+            y_prev = _bgr_to_luma(p_v)
+            ref_bgr = p_v.astype(np.float32)
+            y_temp_max = y_prev
+            low_motion = np.abs(y_vert - y_prev) < 25.0
+        else:
+            n_v = _validate_bgr_frame(next_bgr)  # type: ignore[arg-type]
+            y_next = _bgr_to_luma(n_v)
+            ref_bgr = n_v.astype(np.float32)
+            y_temp_max = y_next
+            low_motion = np.abs(y_vert - y_next) < 25.0
+
+        dropout_mask = ((y - y_temp_max > 18.0) & (vert_spike > 10.0) & (y > 135.0)) | (
+            (vert_spike > 26.0) & (y > 175.0)
+        )
+    else:
+        dropout_mask = (vert_spike > 24.0) & (y > 170.0)
+
+    if not np.any(dropout_mask):
+        return curr_bgr.copy(), 0
+
+    # Dilate horizontally by 2 pixels and vertically by 1 pixel to cover soft edges
+    pad_h = np.pad(dropout_mask, ((0, 0), (2, 2)), mode="constant", constant_values=False)
+    dilated_h = (
+        pad_h[:, :-4]
+        | pad_h[:, 1:-3]
+        | pad_h[:, 2:-2]
+        | pad_h[:, 3:-1]
+        | pad_h[:, 4:]
+    )
+    pad_v = np.pad(dilated_h, ((1, 1), (0, 0)), mode="constant", constant_values=False)
+    dropout_mask = pad_v[:-2, :] | pad_v[1:-1, :] | pad_v[2:, :]
+
+    curr_f = curr_bgr.astype(np.float32)
+    above_bgr = np.pad(curr_f[:-1, :, :], ((1, 0), (0, 0), (0, 0)), mode="edge")
+    below_bgr = np.pad(curr_f[1:, :, :], ((0, 1), (0, 0), (0, 0)), mode="edge")
+    vert_inpaint_bgr = 0.5 * (above_bgr + below_bgr)
+
+    if ref_bgr is not None and low_motion is not None:
+        fill_bgr = np.where(
+            low_motion[:, :, None],
+            0.65 * ref_bgr + 0.35 * vert_inpaint_bgr,
+            vert_inpaint_bgr,
+        )
+    else:
+        fill_bgr = vert_inpaint_bgr
+
+    cleaned = np.where(dropout_mask[:, :, None], fill_bgr, curr_f)
+    cleaned_u8 = np.clip(np.rint(cleaned), 0, 255).astype(np.uint8)
+    return cleaned_u8, int(np.count_nonzero(dropout_mask))
+
+
+def temporal_smooth_4k_frame(
+    curr_4k_bgr: np.ndarray,
+    prev_4k_bgr: np.ndarray | None,
+    strength: float = 0.30,
+) -> np.ndarray:
+    """Apply motion-gated temporal anti-shimmer smoothing between consecutive 4K frames."""
+    curr_4k_bgr = _validate_bgr_frame(curr_4k_bgr)
+    if prev_4k_bgr is None or prev_4k_bgr.shape != curr_4k_bgr.shape or strength <= 0.0:
+        return curr_4k_bgr
+
+    curr_f = curr_4k_bgr.astype(np.float32)
+    prev_f = prev_4k_bgr.astype(np.float32)
+    diff = np.mean(np.abs(curr_f - prev_f), axis=2, keepdims=True)
+    alpha = float(np.clip(strength, 0.0, 0.6)) * np.exp(-((diff / 11.0) ** 2))
+    blended = curr_f * (1.0 - alpha) + prev_f * alpha
+    return np.clip(np.rint(blended), 0, 255).astype(np.uint8)

@@ -8,7 +8,7 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
 
 1. **Source Discovery & Preprocessing (`vhs24k/preprocess.py`)**
    - `discover_sources()` groups DVD `.VOB` titles (`VTS_01_1.VOB`, `VTS_02_1..3.VOB`) while skipping menus (`VIDEO_TS.VOB`, `*_0.VOB`) and `<1 MB` stubs, or discovers `.mp4` files.
-   - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + mild `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
+   - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + temporal stabilization (`atadenoise` + `deflicker`) + gentle `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
 2. **Dual-GPU Upscaling & AI Quality Review (`vhs24k/upscale.py`, `vhs24k/enhancer_worker.py`, `vhs24k/quality_review.py`)**
    - `detect_gpus()` enumerates available CUDA devices via `nvidia-smi -L` (or PyTorch).
    - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with 23-block `RealESRGAN_x4plus`, `--tile 512`, `--face-weight 0.90` (`GFPGANv1.4`), and closed-loop AI quality review.
@@ -31,8 +31,12 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - **VHS Artifact-Free** (absence of interlace combing and YCrCb chroma noise)
 2. **Pre-Upscale VHS Overscan Trimming & Color/Lighting Fix**: `compute_safe_overscan_crop()` and `apply_overscan_crop()` conservatively trim black VHS overscan edges and bottom head-switching noise (`<= 4.5%` left/right, `<= 3.5%` top, `<= 5.5%` bottom, with even dimensions) before upscaling. `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
 3. **23-Block `RealESRGAN_x4plus` + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using the 23-RRDB-block `RealESRGAN_x4plus` generator and blends restored faces with `GFPGANv1.4` (`--face-weight 0.90` by default).
-4. **Post-Upscale 4K Camera Polish & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` adds luminance-only multi-scale micro-contrast with halo suppression. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
-5. **Diagnostics & Visual Proof**: For each chunk, `save_comparison_and_report()` writes `<chunk>_quality_report.json` (before/after scores, grade, fixed deficiencies, and recipe) and `<chunk>_before_vs_after_4k.jpg` (side-by-side comparison). Use `--no-quality-review` to bypass this stage if needed.
+4. **Post-Upscale 4K Camera Polish, Motion-Gated Temporal Smoothing & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` adds luminance-only multi-scale micro-contrast with halo suppression, and `temporal_smooth_4k_frame()` applies motion-gated temporal anti-shimmer smoothing (`exp(-(diff/11)^2)`) so stationary micro-shimmer is stabilized while fast-moving edges stay sharp without ghosting. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
+5. **3-Stage VHS White-Line Dropout Eliminator & Temporal Stabilization**:
+   - **Stage 1 (FFmpeg Preprocess):** `atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08` + `deflicker=size=5:mode=am` stabilize tape grain and luminance flicker before upscaling.
+   - **Stage 2 (Pre-Upscale Frame Inpainting):** `remove_vhs_white_line_dropouts()` detects horizontal white/bright VHS tape dropout streaks against adjacent frames (`prev_bgr`/`next_bgr`) and inpaints them cleanly before Real-ESRGAN runs.
+   - **Stage 3 (Post-Upscale 4K Temporal Smoother):** `temporal_smooth_4k_frame()` suppresses frame-to-frame 4K hallucination shimmer on static regions while preserving motion.
+6. **Diagnostics & Visual Proof**: For each chunk, `save_comparison_and_report()` writes `<chunk>_quality_report.json` (before/after scores, grade, fixed deficiencies, and recipe) and `<chunk>_before_vs_after_4k.jpg` (side-by-side comparison). Use `--no-quality-review` to bypass this stage if needed.
 
 ## Kaggle `GPU T4 x2` Setup
 

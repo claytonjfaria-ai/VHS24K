@@ -20,7 +20,9 @@ from vhs24k.quality_review import (
     closed_loop_review_and_refine,
     compute_safe_overscan_crop,
     derive_enhancement_recipe,
+    remove_vhs_white_line_dropouts,
     save_comparison_and_report,
+    temporal_smooth_4k_frame,
 )
 
 __version__ = "0.1.0"
@@ -45,5 +47,7 @@ __all__ = [
     "discover_sources",
     "prepare_chunks",
     "probe_video",
+    "remove_vhs_white_line_dropouts",
     "save_comparison_and_report",
+    "temporal_smooth_4k_frame",
 ]
