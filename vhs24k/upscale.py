@@ -79,7 +79,7 @@ def build_realesrgan_cmd(
         str(cfg.tile_size),
     ]
     if cfg.model_name == "realesr-general-x4v3":
-        cmd.extend(["--dn", str(cfg.denoise_strength)])
+        cmd.extend(["-dn", str(cfg.denoise_strength)])
     if cfg.face_enhance:
         cmd.append("--face_enhance")
     if not cfg.fp16:

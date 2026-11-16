@@ -201,6 +201,8 @@ def _cmd_assemble(cfg: PipelineConfig) -> int:
 
 def _cmd_run(cfg: PipelineConfig) -> int:
     sources = discover_sources(cfg.input_dir, cfg.source_mode)
+    if cfg.test_clip_seconds is not None:
+        sources = sources[:1]
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     for src in sources:
         manifest_path = prepare_chunks(src, cfg.work_dir, cfg)

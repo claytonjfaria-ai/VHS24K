@@ -209,8 +209,8 @@ class TestRealESRGANCommand:
             tile_size=512,
         )
         cmd_default = build_realesrgan_cmd(chunk_in, chunk_out, cfg_default, esrgan_dir)
-        assert "--dn" in cmd_default
-        assert cmd_default[cmd_default.index("--dn") + 1] == "0.35"
+        assert "-dn" in cmd_default
+        assert cmd_default[cmd_default.index("-dn") + 1] == "0.35"
         assert "--face_enhance" in cmd_default
         assert "--fp32" not in cmd_default
         assert "--tile" in cmd_default
@@ -226,7 +226,7 @@ class TestRealESRGANCommand:
             tile_size=256,
         )
         cmd_alt = build_realesrgan_cmd(chunk_in, chunk_out, cfg_alt, esrgan_dir)
-        assert "--dn" not in cmd_alt
+        assert "-dn" not in cmd_alt
         assert "--face_enhance" not in cmd_alt
         assert "--fp32" in cmd_alt
         assert "--tile" in cmd_alt
