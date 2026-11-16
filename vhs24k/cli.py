@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import sys
@@ -45,13 +46,30 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--model",
-        default="realesr-general-x4v3",
-        help="Real-ESRGAN model name (default: realesr-general-x4v3).",
+        default="RealESRGAN_x4plus",
+        help="Real-ESRGAN model name (default: RealESRGAN_x4plus).",
     )
     parser.add_argument(
         "--no-face-enhance",
         action="store_true",
         help="Disable GFPGAN face enhancement.",
+    )
+    parser.add_argument(
+        "--face-weight",
+        type=float,
+        default=0.8,
+        help="GFPGAN face restoration blending weight in [0.0, 1.0] (default: 0.8).",
+    )
+    parser.add_argument(
+        "--no-quality-review",
+        action="store_true",
+        help="Disable closed-loop AI Quality Review & 4K camera polish.",
+    )
+    parser.add_argument(
+        "--target-quality-score",
+        type=float,
+        default=82.0,
+        help="Target AI quality review score in [0, 100] (default: 82.0).",
     )
     parser.add_argument(
         "--chunk-seconds",
@@ -137,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     """Build a validated ``PipelineConfig`` from parsed CLI arguments."""
+    field_names = {f.name for f in dataclasses.fields(PipelineConfig)}
+    extra: dict[str, object] = {}
+    if "quality_review" in field_names:
+        extra["quality_review"] = not args.no_quality_review
+    if "target_quality_score" in field_names:
+        extra["target_quality_score"] = args.target_quality_score
+
     return PipelineConfig(
         input_dir=args.input_dir,
         work_dir=args.work_dir,
@@ -144,6 +169,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         source_mode=args.source_mode,
         model_name=args.model,
         face_enhance=not args.no_face_enhance,
+        face_weight=args.face_weight,
         chunk_seconds=args.chunk_seconds,
         target_4k_mode=args.target_4k_mode,
         num_gpus=args.num_gpus,
@@ -151,6 +177,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         test_start_seconds=args.test_start,
         realesrgan_dir=args.realesrgan_dir,
         dry_run=args.dry_run,
+        **extra,
     )
 
 

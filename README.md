@@ -1,6 +1,6 @@
 # VHS24K
 
-VHS/DVD to 4K restoration and upscaling pipeline built with Python 3.10+, FFmpeg, and Real-ESRGAN (`realesr-general-x4v3` + GFPGAN face enhancement), designed for dual-GPU Kaggle Notebooks (`2x NVIDIA T4`).
+VHS/DVD to 4K restoration and upscaling pipeline built with Python 3.10+, FFmpeg, Real-ESRGAN (23-block `RealESRGAN_x4plus` + `GFPGANv1.4` face enhancement), and an Automated AI Quality Reviewer (`vhs24k/quality_review.py`), designed for dual-GPU Kaggle Notebooks (`2x NVIDIA T4`).
 
 ## Architecture
 
@@ -9,15 +9,30 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
 1. **Source Discovery & Preprocessing (`vhs24k/preprocess.py`)**
    - `discover_sources()` groups DVD `.VOB` titles (`VTS_01_1.VOB`, `VTS_02_1..3.VOB`) while skipping menus (`VIDEO_TS.VOB`, `*_0.VOB`) and `<1 MB` stubs, or discovers `.mp4` files.
    - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + mild `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
-2. **Dual-GPU Upscaling (`vhs24k/upscale.py`)**
+2. **Dual-GPU Upscaling & AI Quality Review (`vhs24k/upscale.py`, `vhs24k/enhancer_worker.py`, `vhs24k/quality_review.py`)**
    - `detect_gpus()` enumerates available CUDA devices via `nvidia-smi -L` (or PyTorch).
-   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), running `inference_realesrgan_video.py` with `--tile 512`, `--dn`, and optional `--face_enhance` (GFPGAN).
+   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with 23-block `RealESRGAN_x4plus`, `--tile 512`, `--face-weight 0.8` (`GFPGANv1.4`), and closed-loop AI quality review.
    - Updates `manifest.json` atomically (`tempfile` + `os.fsync` + `os.replace`) after every completed chunk.
 3. **4K Assembly & Audio Muxing (`vhs24k/postprocess.py`)**
-   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (`pillarbox_uhd` 2880x2160 padded to 3840x2160 for 4:3 sources, or `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (with `libx264` fallback).
+   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (`pillarbox_uhd` 2880x2160 padded to 3840x2160 for 4:3 sources, or `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (CRF `14`, with `libx264` fallback).
 4. **Google Drive I/O & CLI (`vhs24k/drive_io.py`, `vhs24k/cli.py`, `vhs24k/config.py`)**
    - `PipelineConfig` validates all pipeline parameters.
    - `cli.py` exposes `inspect`, `download`, `prepare`, `upscale`, `assemble`, and `run` subcommands.
+
+## Automated AI Quality Reviewer & Closed-Loop 4K Camera Engine
+
+`vhs24k/quality_review.py` and `vhs24k/enhancer_worker.py` implement a closed-loop perceptual restoration stage around each chunk:
+
+1. **5-Dimension Perceptual Scoring (`0–100`)**: `analyze_frame()` evaluates each frame across:
+   - **Sharpness** (multi-scale Laplacian & Tenengrad gradient energy)
+   - **Face Clarity** (Haar face-patch detail or center-weighted texture)
+   - **Dynamic Range** (luma p98–p2 spread, histogram entropy, and clipping penalty)
+   - **Color Naturalness** (colorfulness + midtone gray-world neutrality)
+   - **VHS Artifact-Free** (absence of interlace combing and YCrCb chroma noise)
+2. **Pre-Upscale VHS Color & Lighting Fix**: `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
+3. **23-Block `RealESRGAN_x4plus` + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using the 23-RRDB-block `RealESRGAN_x4plus` generator and blends restored faces with `GFPGANv1.4` (`--face-weight 0.8` by default).
+4. **Post-Upscale 4K Camera Polish & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` adds luminance-only multi-scale micro-contrast with halo suppression. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
+5. **Diagnostics & Visual Proof**: For each chunk, `save_comparison_and_report()` writes `<chunk>_quality_report.json` (before/after scores, grade, fixed deficiencies, and recipe) and `<chunk>_before_vs_after_4k.jpg` (side-by-side comparison). Use `--no-quality-review` to bypass this stage if needed.
 
 ## Kaggle `GPU T4 x2` Setup
 
@@ -26,7 +41,7 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - Set **Accelerator** to **GPU T4 x2**.
    - Enable **Internet** (required to clone `xinntao/Real-ESRGAN`, install dependencies, and transfer files from Google Drive).
 3. Verify both GPUs are visible (`!nvidia-smi` should list GPU 0 and GPU 1).
-4. The pipeline defaults to `--num-gpus 2`, `--tile 512`, FP16 inference, and `realesr-general-x4v3` so each T4 processes independent 60-second chunks concurrently.
+4. The pipeline defaults to `--num-gpus 2`, `--tile 512`, FP16 inference, and `RealESRGAN_x4plus` so each T4 processes independent 60-second chunks concurrently.
 
 ## Google Drive `Wedding` Folder Integration
 

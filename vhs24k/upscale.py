@@ -87,6 +87,46 @@ def build_realesrgan_cmd(
     return cmd
 
 
+def build_enhancer_worker_cmd(
+    chunk_input: Path,
+    chunk_output_file: Path,
+    cfg: PipelineConfig,
+    realesrgan_dir: Path,
+    report_dir: Path | None = None,
+) -> list[str]:
+    """Build the ``vhs24k.enhancer_worker`` command for a video chunk."""
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "vhs24k.enhancer_worker",
+        "-i",
+        str(chunk_input),
+        "-o",
+        str(chunk_output_file),
+        "-n",
+        cfg.model_name,
+        "--realesrgan-dir",
+        str(realesrgan_dir),
+        "--tile",
+        str(cfg.tile_size),
+        "--dn",
+        str(cfg.denoise_strength),
+        "--face-weight",
+        str(cfg.face_weight),
+        "--target-quality-score",
+        str(getattr(cfg, "target_quality_score", 82.0)),
+    ]
+    if cfg.face_enhance:
+        cmd.append("--face-enhance")
+    if not cfg.fp16:
+        cmd.append("--fp32")
+    if not getattr(cfg, "quality_review", True):
+        cmd.append("--no-quality-review")
+    if report_dir is not None:
+        cmd.extend(["--report-dir", str(report_dir)])
+    return cmd
+
+
 def _atomic_write_json(path: Path, payload: Any) -> None:
     """Atomically write JSON payload to ``path`` using a temp file and ``os.replace``."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,10 +212,17 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
         realesrgan_dir = Path("Real-ESRGAN")
     else:
         realesrgan_dir = Path(cfg.realesrgan_dir)
-    if not cfg.dry_run and not (realesrgan_dir / "inference_realesrgan_video.py").exists():
+    use_enhancer_worker = bool(getattr(cfg, "quality_review", True))
+    if (
+        not cfg.dry_run
+        and not use_enhancer_worker
+        and not (realesrgan_dir / "inference_realesrgan_video.py").exists()
+    ):
         raise FileNotFoundError(
             f"Real-ESRGAN script not found at {realesrgan_dir / 'inference_realesrgan_video.py'}"
         )
+
+    repo_root = str(Path(__file__).resolve().parent.parent)
 
     detected_gpus = detect_gpus()
     num_workers = max(1, min(cfg.num_gpus, max(1, len(detected_gpus))))
@@ -194,11 +241,25 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
         chunk = chunks[chunk_idx]
         chunk_input, chunk_output = _resolve_chunk_io(chunk, cfg)
         chunk_output.mkdir(parents=True, exist_ok=True)
-        cmd = build_realesrgan_cmd(chunk_input, chunk_output, cfg, realesrgan_dir)
+        expected_out = _expected_realesrgan_output(chunk_input, chunk_output)
+        if use_enhancer_worker:
+            cmd = build_enhancer_worker_cmd(
+                chunk_input,
+                expected_out,
+                cfg,
+                realesrgan_dir,
+                report_dir=chunk_output,
+            )
+        else:
+            cmd = build_realesrgan_cmd(chunk_input, chunk_output, cfg, realesrgan_dir)
 
         gpu_id = gpu_queue.get()
         try:
             env = os.environ.copy()
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = (
+                f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+            )
             if gpu_id is not None:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -224,6 +285,11 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
                 raise RuntimeError(
                     f"Real-ESRGAN failed on {chunk_input.name} (exit {proc.returncode}): {err_tail}"
                 )
+
+            if proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if "[Quality Review]" in line:
+                        print(line, flush=True)
 
             produced = _expected_realesrgan_output(chunk_input, chunk_output)
             target_raw = chunk.get("output_path")

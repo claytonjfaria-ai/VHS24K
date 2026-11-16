@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from vhs24k import cli
@@ -17,7 +18,21 @@ from vhs24k.preprocess import (
     discover_sources,
     prepare_chunks,
 )
-from vhs24k.upscale import build_realesrgan_cmd, upscale_manifest
+from vhs24k.quality_review import (
+    EnhancementRecipe,
+    FrameQualityMetrics,
+    analyze_frame,
+    apply_post_upscale_4k_camera_polish,
+    apply_pre_upscale_color_and_lighting,
+    closed_loop_review_and_refine,
+    derive_enhancement_recipe,
+    save_comparison_and_report,
+)
+from vhs24k.upscale import (
+    build_enhancer_worker_cmd,
+    build_realesrgan_cmd,
+    upscale_manifest,
+)
 
 
 def _make_file(path: Path, size: int) -> Path:
@@ -45,18 +60,20 @@ class TestPipelineConfig:
         assert cfg.source_mode == "auto"
         assert cfg.deinterlace == "bwdif"
         assert cfg.denoise_strength == 0.35
-        assert cfg.model_name == "realesr-general-x4v3"
+        assert cfg.model_name == "RealESRGAN_x4plus"
         assert cfg.face_enhance is True
-        assert cfg.face_weight == 0.5
+        assert cfg.face_weight == 0.8
         assert cfg.tile_size == 512
         assert cfg.fp16 is True
         assert cfg.chunk_seconds == 60
         assert cfg.target_4k_mode == "pillarbox_uhd"
-        assert cfg.crf == 16
+        assert cfg.crf == 14
         assert cfg.preset == "medium"
         assert cfg.num_gpus == 2
         assert cfg.test_clip_seconds is None
         assert cfg.dry_run is False
+        assert cfg.quality_review is True
+        assert cfg.target_quality_score == 82.0
 
         serialized = cfg.to_dict()
         assert serialized["input_dir"] == str(tmp_path / "in")
@@ -78,6 +95,8 @@ class TestPipelineConfig:
             {"tile_size": 0},
             {"num_gpus": 0},
             {"test_clip_seconds": 0},
+            {"target_quality_score": -0.1},
+            {"target_quality_score": 100.1},
         ],
     )
     def test_validation_errors(self, tmp_path: Path, kwargs: dict) -> None:
@@ -232,6 +251,49 @@ class TestRealESRGANCommand:
         assert "--tile" in cmd_alt
         assert cmd_alt[cmd_alt.index("--tile") + 1] == "256"
 
+    def test_enhancer_worker_cmd_flags(self, tmp_path: Path) -> None:
+        esrgan_dir = tmp_path / "Real-ESRGAN"
+        chunk_in = tmp_path / "chunks" / "chunk_0000.mp4"
+        chunk_out_file = tmp_path / "upscaled" / "chunk_0000.mp4"
+        report_dir = tmp_path / "reports"
+
+        cfg_default = PipelineConfig(
+            input_dir=tmp_path,
+            work_dir=tmp_path,
+            output_dir=tmp_path,
+        )
+        cmd_default = build_enhancer_worker_cmd(
+            chunk_in, chunk_out_file, cfg_default, esrgan_dir, report_dir=report_dir
+        )
+        assert "vhs24k.enhancer_worker" in cmd_default
+        assert cmd_default[cmd_default.index("-n") + 1] == "RealESRGAN_x4plus"
+        assert cmd_default[cmd_default.index("--face-weight") + 1] == "0.8"
+        assert cmd_default[cmd_default.index("--target-quality-score") + 1] == "82.0"
+        assert "--face-enhance" in cmd_default
+        assert "--fp32" not in cmd_default
+        assert "--no-quality-review" not in cmd_default
+        assert cmd_default[cmd_default.index("--report-dir") + 1] == str(report_dir)
+
+        cfg_disabled = PipelineConfig(
+            input_dir=tmp_path,
+            work_dir=tmp_path,
+            output_dir=tmp_path,
+            face_enhance=False,
+            fp16=False,
+            quality_review=False,
+            face_weight=0.4,
+            target_quality_score=75.0,
+        )
+        cmd_disabled = build_enhancer_worker_cmd(
+            chunk_in, chunk_out_file, cfg_disabled, esrgan_dir, report_dir=None
+        )
+        assert "--face-enhance" not in cmd_disabled
+        assert "--fp32" in cmd_disabled
+        assert "--no-quality-review" in cmd_disabled
+        assert "--report-dir" not in cmd_disabled
+        assert cmd_disabled[cmd_disabled.index("--face-weight") + 1] == "0.4"
+        assert cmd_disabled[cmd_disabled.index("--target-quality-score") + 1] == "75.0"
+
 
 class TestManifestCompatibilityAndDryRun:
     def test_prepare_chunks_dry_run(self, tmp_path: Path) -> None:
@@ -331,6 +393,11 @@ class TestCLI:
                 "--model",
                 "RealESRGAN_x4plus",
                 "--no-face-enhance",
+                "--face-weight",
+                "0.65",
+                "--no-quality-review",
+                "--target-quality-score",
+                "88.5",
                 "--chunk-seconds",
                 "30",
                 "--test-clip",
@@ -347,6 +414,9 @@ class TestCLI:
         assert cfg.source_mode == "vob"
         assert cfg.model_name == "RealESRGAN_x4plus"
         assert cfg.face_enhance is False
+        assert cfg.face_weight == 0.65
+        assert cfg.quality_review is False
+        assert cfg.target_quality_score == 88.5
         assert cfg.chunk_seconds == 30
         assert cfg.test_clip_seconds == 15
         assert cfg.num_gpus == 1
@@ -378,3 +448,154 @@ class TestCLI:
         assert manifest_path.is_file()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["status"] == "dry_run"
+
+
+def _make_synthetic_vhs_frame(height: int = 120, width: int = 160) -> np.ndarray:
+    """Create a synthetic BGR frame with warm VHS color cast and compressed dynamic range."""
+    rng = np.random.default_rng(42)
+    yy = np.linspace(60, 140, height, dtype=np.float32)[:, None]
+    xx = np.linspace(0, 40, width, dtype=np.float32)[None, :]
+    base = yy + xx
+    # Strong warm/yellow cast (low blue, high red)
+    b = np.clip(base * 0.55 + rng.normal(0, 2.0, (height, width)), 0, 255)
+    g = np.clip(base * 0.90 + rng.normal(0, 2.0, (height, width)), 0, 255)
+    r = np.clip(base * 1.15 + rng.normal(0, 2.0, (height, width)), 0, 255)
+    return np.stack([b, g, r], axis=-1).astype(np.uint8)
+
+
+def _make_textured_frame(height: int = 120, width: int = 160) -> np.ndarray:
+    """Create a high-contrast, sharp checkerboard-textured BGR frame."""
+    yy, xx = np.mgrid[0:height, 0:width]
+    pattern = (((yy // 4) + (xx // 4)) % 2) * 180 + 35
+    # Add colorful vertical gradient so colorfulness & dynamic range are high
+    b = np.clip(pattern + (xx % 40) - 20, 0, 255).astype(np.uint8)
+    g = np.clip(pattern, 0, 255).astype(np.uint8)
+    r = np.clip(pattern + (yy % 40) - 20, 0, 255).astype(np.uint8)
+    return np.stack([b, g, r], axis=-1)
+
+
+class TestQualityReview:
+    def test_analyze_frame_metrics_and_deficiencies(self) -> None:
+        vhs_frame = _make_synthetic_vhs_frame()
+        metrics = analyze_frame(vhs_frame)
+        assert isinstance(metrics, FrameQualityMetrics)
+        assert 0.0 <= metrics.overall_score <= 100.0
+        assert 0.0 <= metrics.sharpness <= 100.0
+        assert 0.0 <= metrics.face_clarity <= 100.0
+        assert 0.0 <= metrics.dynamic_range <= 100.0
+        assert 0.0 <= metrics.color_naturalness <= 100.0
+        assert 0.0 <= metrics.vhs_artifact_free <= 100.0
+        assert metrics.grade
+        assert "vhs_color_cast" in metrics.deficiencies
+
+        with pytest.raises(TypeError):
+            analyze_frame([[1, 2, 3]])  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            analyze_frame(np.zeros((10, 10), dtype=np.uint8))
+
+    def test_derive_enhancement_recipe_adapts_to_deficiencies(self) -> None:
+        weak_metrics = FrameQualityMetrics(
+            sharpness=50.0,
+            face_clarity=55.0,
+            dynamic_range=50.0,
+            color_naturalness=50.0,
+            vhs_artifact_free=60.0,
+            overall_score=53.0,
+            grade="C (Needs Re-Enhancement)",
+            deficiencies=[
+                "soft_scene_textures",
+                "soft_faces",
+                "compressed_dynamic_range",
+                "vhs_color_cast",
+                "muted_saturation",
+                "chroma_noise",
+            ],
+        )
+        recipe = derive_enhancement_recipe(weak_metrics, base_face_weight=0.75)
+        assert recipe.wb_strength == 0.85
+        assert recipe.clahe_clip_limit == 2.4
+        assert recipe.vibrance_boost == 0.40
+        assert recipe.chroma_denoise == 0.75
+        assert recipe.micro_contrast == 0.62
+        assert recipe.face_weight == 0.85
+
+        clean_metrics = FrameQualityMetrics(
+            sharpness=90.0,
+            face_clarity=88.0,
+            dynamic_range=88.0,
+            color_naturalness=90.0,
+            vhs_artifact_free=92.0,
+            overall_score=89.6,
+            grade="A+ (Modern 4K Camera)",
+            deficiencies=[],
+        )
+        clean_recipe = derive_enhancement_recipe(clean_metrics, base_face_weight=0.75)
+        assert clean_recipe.wb_strength == 0.55
+        assert clean_recipe.clahe_clip_limit == 1.6
+        assert clean_recipe.face_weight == 0.75
+
+    def test_pre_upscale_color_and_lighting_and_post_polish(self) -> None:
+        vhs_frame = _make_synthetic_vhs_frame()
+        metrics = analyze_frame(vhs_frame)
+        recipe = derive_enhancement_recipe(metrics)
+
+        pre_fixed = apply_pre_upscale_color_and_lighting(vhs_frame, recipe)
+        assert pre_fixed.shape == vhs_frame.shape
+        assert pre_fixed.dtype == np.uint8
+
+        pre_metrics = analyze_frame(pre_fixed)
+        assert pre_metrics.color_naturalness >= metrics.color_naturalness
+
+        polished = apply_post_upscale_4k_camera_polish(pre_fixed, recipe)
+        assert polished.shape == pre_fixed.shape
+        assert polished.dtype == np.uint8
+
+    def test_closed_loop_review_and_refine(self) -> None:
+        before = _make_synthetic_vhs_frame()
+        recipe = EnhancementRecipe()
+
+        # Soft after-frame below target_score=95 triggers second-pass refinement
+        out_frame, before_m, after_m, updated_recipe, refined = closed_loop_review_and_refine(
+            before, before, recipe, target_score=95.0
+        )
+        assert refined is True
+        assert updated_recipe.second_pass_sharpen > 0.0
+        assert out_frame.shape == before.shape
+        assert isinstance(before_m, FrameQualityMetrics)
+        assert isinstance(after_m, FrameQualityMetrics)
+
+        # Sharp after-frame above low target_score skips second-pass refinement
+        sharp = _make_textured_frame()
+        out_sharp, _, sharp_m, unchanged_recipe, refined_sharp = closed_loop_review_and_refine(
+            before, sharp, recipe, target_score=50.0
+        )
+        assert sharp_m.sharpness >= 75.0
+        assert refined_sharp is False
+        assert unchanged_recipe.second_pass_sharpen == 0.0
+        assert out_sharp is sharp
+
+    def test_save_comparison_and_report(self, tmp_path: Path) -> None:
+        before = _make_synthetic_vhs_frame()
+        after = _make_textured_frame(height=240, width=320)
+        before_m = analyze_frame(before)
+        after_m = analyze_frame(after)
+        recipe = EnhancementRecipe()
+
+        saved = save_comparison_and_report(
+            before_bgr=before,
+            after_bgr=after,
+            before_metrics=before_m,
+            after_metrics=after_m,
+            recipe=recipe,
+            output_dir=tmp_path / "reports",
+            prefix="chunk_0000",
+        )
+        report_path = Path(saved["report_json"])
+        assert report_path.is_file()
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        assert payload["before"]["overall_score"] == before_m.overall_score
+        assert payload["after"]["overall_score"] == after_m.overall_score
+        assert payload["grade"] == after_m.grade
+        assert "recipe" in payload
+        if "comparison_jpg" in saved:
+            assert Path(saved["comparison_jpg"]).is_file()

@@ -93,7 +93,16 @@ def _build_assemble_command(
         cmd.extend(["-i", str(audio_path)])
 
     cmd.extend(["-vf", vf_filter, "-c:v", codec, "-crf", str(cfg.crf), "-preset", cfg.preset])
-    cmd.extend(["-pix_fmt", "yuv420p"])
+    cmd.extend([
+        "-pix_fmt",
+        "yuv420p",
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+    ])
 
     if audio_path is not None:
         cmd.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"])

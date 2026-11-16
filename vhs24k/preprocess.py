@@ -221,6 +221,10 @@ def _is_manifest_prepared(manifest_path: Path, cfg: PipelineConfig | None = None
             return False
         if cfg.test_clip_seconds is not None and data.get("test_start_seconds") != cfg.test_start_seconds:
             return False
+        if data.get("model_name") != cfg.model_name:
+            return False
+        if data.get("quality_review") != cfg.quality_review:
+            return False
     chunks = data.get("chunks")
     if not chunks:
         return False
@@ -337,6 +341,8 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         "audio_path": str(audio_path) if audio_cmd else None,
         "test_clip_seconds": cfg.test_clip_seconds,
         "test_start_seconds": cfg.test_start_seconds if cfg.test_clip_seconds is not None else 0,
+        "model_name": cfg.model_name,
+        "quality_review": cfg.quality_review,
         "planned_commands": {
             "video": video_cmd,
             "audio": audio_cmd,

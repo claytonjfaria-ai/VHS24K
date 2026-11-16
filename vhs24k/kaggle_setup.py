@@ -14,6 +14,9 @@ import urllib.request
 BASICSR_SDIST_URL = "https://files.pythonhosted.org/packages/source/b/basicsr/basicsr-1.4.2.tar.gz"
 
 WEIGHT_URLS = {
+    "weights/RealESRGAN_x4plus.pth": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+    ),
     "weights/realesr-general-x4v3.pth": (
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
     ),

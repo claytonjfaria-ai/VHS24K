@@ -17,20 +17,22 @@ class PipelineConfig:
     source_mode: Literal["vob", "mp4", "auto"] = "auto"
     deinterlace: Literal["bwdif", "yadif", "none"] = "bwdif"
     denoise_strength: float = 0.35
-    model_name: str = "realesr-general-x4v3"
+    model_name: str = "RealESRGAN_x4plus"
     face_enhance: bool = True
-    face_weight: float = 0.5
+    face_weight: float = 0.8
     tile_size: int = 512
     fp16: bool = True
     chunk_seconds: int = 60
     target_4k_mode: Literal["pillarbox_uhd", "native_4x"] = "pillarbox_uhd"
-    crf: int = 16
+    crf: int = 14
     preset: str = "medium"
     num_gpus: int = 2
     test_clip_seconds: int | None = None
     test_start_seconds: int = 120
     realesrgan_dir: Path | None = None
     dry_run: bool = False
+    quality_review: bool = True
+    target_quality_score: float = 82.0
 
     def __post_init__(self) -> None:
         self.input_dir = Path(self.input_dir)
@@ -60,6 +62,10 @@ class PipelineConfig:
         if self.test_clip_seconds is not None and self.test_clip_seconds <= 0:
             raise ValueError(
                 f"test_clip_seconds must be > 0 when set, got {self.test_clip_seconds}"
+            )
+        if not 0.0 <= self.target_quality_score <= 100.0:
+            raise ValueError(
+                f"target_quality_score must be in [0.0, 100.0], got {self.target_quality_score}"
             )
 
     def to_dict(self) -> dict[str, Any]:
