@@ -16,14 +16,14 @@ class PipelineConfig:
     output_dir: Path
     source_mode: Literal["vob", "mp4", "auto"] = "auto"
     deinterlace: Literal["bwdif", "yadif", "none"] = "bwdif"
-    denoise_strength: float = 0.35
+    denoise_strength: float = 0.20
     model_name: str = "RealESRGAN_x4plus"
     face_enhance: bool = True
-    face_weight: float = 0.8
+    face_weight: float = 0.90
     tile_size: int = 512
     fp16: bool = True
     chunk_seconds: int = 60
-    target_4k_mode: Literal["pillarbox_uhd", "native_4x"] = "pillarbox_uhd"
+    target_4k_mode: Literal["fullscreen_uhd", "pillarbox_uhd", "native_4x"] = "fullscreen_uhd"
     crf: int = 14
     preset: str = "medium"
     num_gpus: int = 2
@@ -45,7 +45,7 @@ class PipelineConfig:
             raise ValueError(f"Unsupported source_mode: {self.source_mode!r}")
         if self.deinterlace not in ("bwdif", "yadif", "none"):
             raise ValueError(f"Unsupported deinterlace: {self.deinterlace!r}")
-        if self.target_4k_mode not in ("pillarbox_uhd", "native_4x"):
+        if self.target_4k_mode not in ("fullscreen_uhd", "pillarbox_uhd", "native_4x"):
             raise ValueError(f"Unsupported target_4k_mode: {self.target_4k_mode!r}")
         if not 0.0 <= self.denoise_strength <= 1.0:
             raise ValueError(f"denoise_strength must be in [0.0, 1.0], got {self.denoise_strength}")

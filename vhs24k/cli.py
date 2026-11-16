@@ -57,8 +57,8 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--face-weight",
         type=float,
-        default=0.8,
-        help="GFPGAN face restoration blending weight in [0.0, 1.0] (default: 0.8).",
+        default=0.90,
+        help="GFPGAN face restoration blending weight in [0.0, 1.0] (default: 0.90).",
     )
     parser.add_argument(
         "--no-quality-review",
@@ -98,9 +98,9 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--4k-mode",
         dest="target_4k_mode",
-        choices=("pillarbox_uhd", "native_4x"),
-        default="pillarbox_uhd",
-        help="4K output framing mode (default: pillarbox_uhd).",
+        choices=("fullscreen_uhd", "pillarbox_uhd", "native_4x"),
+        default="fullscreen_uhd",
+        help="4K output framing mode (default: fullscreen_uhd).",
     )
     parser.add_argument(
         "--realesrgan-dir",

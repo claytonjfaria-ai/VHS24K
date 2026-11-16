@@ -11,10 +11,10 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + mild `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
 2. **Dual-GPU Upscaling & AI Quality Review (`vhs24k/upscale.py`, `vhs24k/enhancer_worker.py`, `vhs24k/quality_review.py`)**
    - `detect_gpus()` enumerates available CUDA devices via `nvidia-smi -L` (or PyTorch).
-   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with 23-block `RealESRGAN_x4plus`, `--tile 512`, `--face-weight 0.8` (`GFPGANv1.4`), and closed-loop AI quality review.
+   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with 23-block `RealESRGAN_x4plus`, `--tile 512`, `--face-weight 0.90` (`GFPGANv1.4`), and closed-loop AI quality review.
    - Updates `manifest.json` atomically (`tempfile` + `os.fsync` + `os.replace`) after every completed chunk.
 3. **4K Assembly & Audio Muxing (`vhs24k/postprocess.py`)**
-   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (`pillarbox_uhd` 2880x2160 padded to 3840x2160 for 4:3 sources, or `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (CRF `14`, with `libx264` fallback).
+   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (default `--4k-mode fullscreen_uhd`: borderless 3840x2160 full-screen scaling with 4K luma acutance; or `pillarbox_uhd` / `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (CRF `14`, with `libx264` fallback).
 4. **Google Drive I/O & CLI (`vhs24k/drive_io.py`, `vhs24k/cli.py`, `vhs24k/config.py`)**
    - `PipelineConfig` validates all pipeline parameters.
    - `cli.py` exposes `inspect`, `download`, `prepare`, `upscale`, `assemble`, and `run` subcommands.
@@ -29,8 +29,8 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - **Dynamic Range** (luma p98–p2 spread, histogram entropy, and clipping penalty)
    - **Color Naturalness** (colorfulness + midtone gray-world neutrality)
    - **VHS Artifact-Free** (absence of interlace combing and YCrCb chroma noise)
-2. **Pre-Upscale VHS Color & Lighting Fix**: `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
-3. **23-Block `RealESRGAN_x4plus` + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using the 23-RRDB-block `RealESRGAN_x4plus` generator and blends restored faces with `GFPGANv1.4` (`--face-weight 0.8` by default).
+2. **Pre-Upscale VHS Overscan Trimming & Color/Lighting Fix**: `compute_safe_overscan_crop()` and `apply_overscan_crop()` conservatively trim black VHS overscan edges and bottom head-switching noise (`<= 4.5%` left/right, `<= 3.5%` top, `<= 5.5%` bottom, with even dimensions) before upscaling. `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
+3. **23-Block `RealESRGAN_x4plus` + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using the 23-RRDB-block `RealESRGAN_x4plus` generator and blends restored faces with `GFPGANv1.4` (`--face-weight 0.90` by default).
 4. **Post-Upscale 4K Camera Polish & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` adds luminance-only multi-scale micro-contrast with halo suppression. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
 5. **Diagnostics & Visual Proof**: For each chunk, `save_comparison_and_report()` writes `<chunk>_quality_report.json` (before/after scores, grade, fixed deficiencies, and recipe) and `<chunk>_before_vs_after_4k.jpg` (side-by-side comparison). Use `--no-quality-review` to bypass this stage if needed.
 

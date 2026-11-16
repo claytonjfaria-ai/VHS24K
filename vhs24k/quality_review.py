@@ -49,8 +49,9 @@ class EnhancementRecipe:
     clahe_clip_limit: float = 1.8
     vibrance_boost: float = 0.25
     chroma_denoise: float = 0.50
-    micro_contrast: float = 0.45
-    face_weight: float = 0.80
+    micro_contrast: float = 0.75
+    face_weight: float = 0.90
+    pre_sharpen: float = 0.45
     second_pass_sharpen: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,6 +90,88 @@ def _extract_active_region(frame_bgr: np.ndarray) -> np.ndarray:
     if (y1 - y0) * (x1 - x0) < 0.1 * frame_bgr.shape[0] * frame_bgr.shape[1]:
         return frame_bgr
     return frame_bgr[y0:y1, x0:x1]
+
+
+def compute_safe_overscan_crop(
+    frames_bgr: list[np.ndarray],
+    max_lr_ratio: float = 0.045,
+    max_top_ratio: float = 0.035,
+    max_bottom_ratio: float = 0.055,
+) -> tuple[int, int, int, int]:
+    """Compute a locked, conservative VHS overscan/black-border crop box (y0, y1, x0, x1)."""
+    if not frames_bgr:
+        raise ValueError("frames_bgr must contain at least one frame")
+
+    validated = [_validate_bgr_frame(f) for f in frames_bgr]
+    h, w = validated[0].shape[:2]
+    lumas = [_bgr_to_luma(f) for f in validated if f.shape[:2] == (h, w)]
+    mean_luma = np.mean(lumas, axis=0)
+    col_luma = mean_luma.mean(axis=0)
+    row_luma = mean_luma.mean(axis=1)
+
+    min_lr = int(round(w * 0.015))
+    max_lr = int(w * max_lr_ratio)
+    x0 = 0
+    while x0 < max_lr and col_luma[x0] < 28.0:
+        x0 += 1
+    x0 = min(max(x0, min_lr), max_lr)
+
+    right_trim = 0
+    while right_trim < max_lr and col_luma[w - 1 - right_trim] < 28.0:
+        right_trim += 1
+    right_trim = min(max(right_trim, min_lr), max_lr)
+    x1 = w - right_trim
+
+    min_top = int(round(h * 0.020))
+    max_top = int(h * max_top_ratio)
+    y0 = 0
+    while y0 < max_top and row_luma[y0] < 28.0:
+        y0 += 1
+    y0 = min(max(y0, min_top), max_top)
+
+    min_bot = int(round(h * 0.035))
+    max_bot = int(h * max_bottom_ratio)
+    bot_trim = 0
+    while bot_trim < max_bot and row_luma[h - 1 - bot_trim] < 28.0:
+        bot_trim += 1
+    bot_trim = min(max(bot_trim, min_bot), max_bot)
+    y1 = h - bot_trim
+
+    # Guarantee even dimensions >= 16
+    if (x1 - x0) < 16:
+        x0, x1 = 0, w - (w % 2)
+    elif (x1 - x0) % 2 != 0:
+        if x1 < w:
+            x1 += 1
+        else:
+            x1 -= 1
+
+    if (y1 - y0) < 16:
+        y0, y1 = 0, h - (h % 2)
+    elif (y1 - y0) % 2 != 0:
+        if y1 < h:
+            y1 += 1
+        else:
+            y1 -= 1
+
+    return int(y0), int(y1), int(x0), int(x1)
+
+
+def apply_overscan_crop(
+    frame_bgr: np.ndarray,
+    crop_box: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Safely apply a (y0, y1, x0, x1) overscan crop box to a BGR frame."""
+    frame_bgr = _validate_bgr_frame(frame_bgr)
+    if crop_box is None:
+        return frame_bgr
+    y0, y1, x0, x1 = crop_box
+    h, w = frame_bgr.shape[:2]
+    y0_c = max(0, min(y0, h - 1))
+    y1_c = max(y0_c + 1, min(y1, h))
+    x0_c = max(0, min(x0, w - 1))
+    x1_c = max(x0_c + 1, min(x1, w))
+    return frame_bgr[y0_c:y1_c, x0_c:x1_c]
 
 
 def _box_blur_2d(arr: np.ndarray, radius: int) -> np.ndarray:
@@ -168,10 +251,22 @@ def _tenengrad_energy(luma: np.ndarray) -> float:
     return float(np.percentile(mag, 90))
 
 
+def _multiscale_edge_energy(luma: np.ndarray) -> tuple[float, float]:
+    """Compute (laplacian_energy, tenengrad_energy), taking max across 4K strides when >= 1000px."""
+    strides = (1, 2, 4) if min(luma.shape) >= 1000 else (1,)
+    laps: list[float] = []
+    tens: list[float] = []
+    for s in strides:
+        sub = luma[::s, ::s]
+        if min(sub.shape) >= 4:
+            laps.append(_laplacian_energy(sub))
+            tens.append(_tenengrad_energy(sub))
+    return (max(laps) if laps else 0.0), (max(tens) if tens else 0.0)
+
+
 def _compute_sharpness(luma: np.ndarray) -> float:
     """Compute multi-scale sharpness score in [0, 100]."""
-    lap_full = _laplacian_energy(luma)
-    ten_full = _tenengrad_energy(luma)
+    lap_full, ten_full = _multiscale_edge_energy(luma)
     luma_half = luma[::2, ::2]
     lap_half = _laplacian_energy(luma_half) if min(luma_half.shape) >= 4 else lap_full
 
@@ -202,6 +297,7 @@ def _get_face_cascade() -> Any:
 def _compute_face_clarity(active_bgr: np.ndarray, luma: np.ndarray) -> float:
     """Compute facial clarity (via Haar cascade if available) or center-weighted texture."""
     cascade = _get_face_cascade()
+    is_4k = min(luma.shape) >= 1000
     if cascade is not None and cv2 is not None:
         gray_u8 = np.clip(luma, 0, 255).astype(np.uint8)
         faces = cascade.detectMultiScale(gray_u8, scaleFactor=1.15, minNeighbors=5, minSize=(32, 32))
@@ -210,21 +306,39 @@ def _compute_face_clarity(active_bgr: np.ndarray, luma: np.ndarray) -> float:
             for x, y, w, h in faces:
                 patch = luma[y : y + h, x : x + w]
                 if patch.shape[0] >= 8 and patch.shape[1] >= 8:
-                    energies.append(0.6 * _laplacian_energy(patch) + 0.4 * _tenengrad_energy(patch))
+                    strides = (1, 2, 4) if is_4k and min(patch.shape) >= 64 else (1,)
+                    patch_scores = [
+                        0.6 * _laplacian_energy(patch[::s, ::s]) + 0.4 * _tenengrad_energy(patch[::s, ::s])
+                        for s in strides
+                        if min(patch[::s, ::s].shape) >= 4
+                    ]
+                    if patch_scores:
+                        energies.append(max(patch_scores))
             if energies:
                 face_energy = float(np.mean(energies))
                 return float(np.clip(100.0 * (1.0 - np.exp(-face_energy / 14.0)), 0.0, 100.0))
 
     h, w = luma.shape
-    yy = np.linspace(-1.0, 1.0, h, dtype=np.float32)[:, None]
-    xx = np.linspace(-1.0, 1.0, w, dtype=np.float32)[None, :]
-    center_weights = np.exp(-2.5 * (xx * xx + yy * yy))
-    detail = np.abs(luma - _smooth_2d(luma, 2))
-    weighted_detail = float(np.sum(detail * center_weights) / max(float(np.sum(center_weights)), 1e-6))
-    center_lap = _laplacian_energy(
-        luma[h // 6 : max(h // 6 + 4, 5 * h // 6), w // 6 : max(w // 6 + 4, 5 * w // 6)]
-    )
-    combined = 0.55 * center_lap + 1.8 * weighted_detail
+    center_crop = luma[h // 6 : max(h // 6 + 4, 5 * h // 6), w // 6 : max(w // 6 + 4, 5 * w // 6)]
+    strides = (1, 2, 4) if is_4k else (1,)
+    combined_candidates: list[float] = []
+    for s in strides:
+        sub = luma[::s, ::s]
+        sub_center = center_crop[::s, ::s]
+        if min(sub.shape) < 8 or min(sub_center.shape) < 4:
+            continue
+        sh, sw = sub.shape
+        yy = np.linspace(-1.0, 1.0, sh, dtype=np.float32)[:, None]
+        xx = np.linspace(-1.0, 1.0, sw, dtype=np.float32)[None, :]
+        center_weights = np.exp(-2.5 * (xx * xx + yy * yy))
+        detail = np.abs(sub - _smooth_2d(sub, 2))
+        weighted_detail = float(
+            np.sum(detail * center_weights) / max(float(np.sum(center_weights)), 1e-6)
+        )
+        center_lap = _laplacian_energy(sub_center)
+        combined_candidates.append(0.55 * center_lap + 1.8 * weighted_detail)
+
+    combined = max(combined_candidates) if combined_candidates else 0.0
     return float(np.clip(100.0 * (1.0 - np.exp(-combined / 14.0)), 0.0, 100.0))
 
 
@@ -369,7 +483,7 @@ def analyze_frame(frame_bgr: np.ndarray) -> FrameQualityMetrics:
 
 def derive_enhancement_recipe(
     metrics: FrameQualityMetrics,
-    base_face_weight: float = 0.80,
+    base_face_weight: float = 0.90,
 ) -> EnhancementRecipe:
     """Derive a scene-adaptive enhancement recipe from FrameQualityMetrics."""
     defs = set(metrics.deficiencies)
@@ -378,8 +492,9 @@ def derive_enhancement_recipe(
     clahe_clip_limit = 2.4 if "compressed_dynamic_range" in defs else 1.6
     vibrance_boost = 0.40 if "muted_saturation" in defs else 0.22
     chroma_denoise = 0.75 if "chroma_noise" in defs else 0.40
-    micro_contrast = 0.62 if "soft_scene_textures" in defs else 0.42
-    face_weight = min(1.0, max(base_face_weight, 0.85)) if "soft_faces" in defs else base_face_weight
+    micro_contrast = 0.85 if "soft_scene_textures" in defs else 0.72
+    pre_sharpen = 0.55 if ("soft_scene_textures" in defs or "soft_faces" in defs) else 0.40
+    face_weight = min(1.0, max(base_face_weight, 0.92)) if "soft_faces" in defs else base_face_weight
 
     return EnhancementRecipe(
         wb_strength=round(wb_strength, 3),
@@ -388,6 +503,7 @@ def derive_enhancement_recipe(
         chroma_denoise=round(chroma_denoise, 3),
         micro_contrast=round(micro_contrast, 3),
         face_weight=round(face_weight, 3),
+        pre_sharpen=round(pre_sharpen, 3),
         second_pass_sharpen=0.0,
     )
 
@@ -477,6 +593,14 @@ def apply_pre_upscale_color_and_lighting(
         f = luma_f[:, :, None] + (f - luma_f[:, :, None]) * (1.0 + boost[:, :, None])
         work_u8 = np.clip(np.rint(f), 0, 255).astype(np.uint8)
 
+    # 5. Pre-upscale luma edge acutance pre-emphasis for RealESRGAN_x4plus + GFPGANv1.4
+    pre_sharpen = float(getattr(recipe, "pre_sharpen", 0.45))
+    if pre_sharpen > 0.0:
+        y_p, cr_p, cb_p = _bgr_to_ycrcb_np(work_u8)
+        y_detail = y_p - _smooth_2d(y_p, 1)
+        y_p = np.clip(y_p + np.clip(pre_sharpen * 1.2 * y_detail, -16.0, 16.0), 0.0, 255.0)
+        work_u8 = _ycrcb_to_bgr_np(y_p, cr_p, cb_p)
+
     return work_u8
 
 
@@ -484,21 +608,24 @@ def apply_post_upscale_4k_camera_polish(
     frame_bgr: np.ndarray,
     recipe: EnhancementRecipe,
 ) -> np.ndarray:
-    """Apply luminance-only multi-scale micro-contrast & detail synthesis with halo suppression."""
+    """Apply 4K-scaled multi-band luminance micro-contrast & detail synthesis with halo suppression."""
     frame_bgr = _validate_bgr_frame(frame_bgr)
     y, cr, cb = _bgr_to_ycrcb_np(frame_bgr)
 
-    blur_fine = _smooth_2d(y, 1)
-    blur_med = _smooth_2d(y, 4)
+    blur_fine = _smooth_2d(y, 2)
+    blur_med = _smooth_2d(y, 5)
+    blur_coarse = _smooth_2d(y, 10)
 
     fine_detail = y - blur_fine
     med_detail = blur_fine - blur_med
+    coarse_detail = blur_med - blur_coarse
 
-    g_fine = 0.65 * recipe.micro_contrast + 0.85 * recipe.second_pass_sharpen
-    g_med = 0.35 * recipe.micro_contrast + 0.30 * recipe.second_pass_sharpen
+    g_fine = 1.35 * recipe.micro_contrast + 1.40 * recipe.second_pass_sharpen
+    g_med = 0.95 * recipe.micro_contrast + 1.00 * recipe.second_pass_sharpen
+    g_coarse = 0.45 * recipe.micro_contrast + 0.40 * recipe.second_pass_sharpen
 
-    delta = g_fine * fine_detail + g_med * med_detail
-    max_delta = 18.0 + 10.0 * recipe.second_pass_sharpen
+    delta = g_fine * fine_detail + g_med * med_detail + g_coarse * coarse_detail
+    max_delta = 30.0 + 14.0 * recipe.second_pass_sharpen
     # Soft-clip / clamp delta to prevent ringing halos and protect extreme highlights/shadows
     midtone_mask = np.clip(np.minimum(y, 255.0 - y) / 24.0, 0.25, 1.0)
     delta = np.clip(delta, -max_delta, max_delta) * midtone_mask
@@ -513,33 +640,61 @@ def closed_loop_review_and_refine(
     recipe: EnhancementRecipe,
     target_score: float = 82.0,
 ) -> tuple[np.ndarray, FrameQualityMetrics, FrameQualityMetrics, EnhancementRecipe, bool]:
-    """Evaluate before/after frames and automatically refine if below target_score."""
+    """Evaluate before/after frames and iteratively refine until target quality is reached."""
     before_metrics = analyze_frame(before_bgr)
     after_metrics = analyze_frame(after_bgr)
 
-    if after_metrics.overall_score >= target_score and after_metrics.sharpness >= 75.0:
+    if (
+        after_metrics.overall_score >= target_score
+        and after_metrics.sharpness >= 80.0
+        and after_metrics.face_clarity >= 80.0
+        and not after_metrics.deficiencies
+    ):
         return after_bgr, before_metrics, after_metrics, recipe, False
 
-    score_deficit = max(0.0, target_score - after_metrics.overall_score)
-    sharp_deficit = max(0.0, 75.0 - after_metrics.sharpness)
-    extra_sharpen = float(np.clip(0.35 + 0.015 * max(score_deficit, sharp_deficit), 0.30, 0.75))
+    best_bgr = after_bgr
+    best_metrics = after_metrics
+    current_recipe = recipe
 
-    updated_recipe = EnhancementRecipe(
-        wb_strength=recipe.wb_strength,
-        clahe_clip_limit=recipe.clahe_clip_limit,
-        vibrance_boost=recipe.vibrance_boost,
-        chroma_denoise=recipe.chroma_denoise,
-        micro_contrast=min(0.85, recipe.micro_contrast + 0.15),
-        face_weight=recipe.face_weight,
-        second_pass_sharpen=round(extra_sharpen, 3),
-    )
+    for iteration in range(2):
+        score_deficit = max(0.0, target_score - best_metrics.overall_score)
+        sharp_deficit = max(
+            0.0,
+            80.0 - min(best_metrics.sharpness, best_metrics.face_clarity),
+        )
+        extra_sharpen = float(
+            np.clip(
+                0.38 + 0.22 * iteration + 0.015 * max(score_deficit, sharp_deficit),
+                0.35,
+                0.95,
+            )
+        )
+        current_recipe = EnhancementRecipe(
+            wb_strength=current_recipe.wb_strength,
+            clahe_clip_limit=current_recipe.clahe_clip_limit,
+            vibrance_boost=current_recipe.vibrance_boost,
+            chroma_denoise=current_recipe.chroma_denoise,
+            micro_contrast=round(min(1.0, current_recipe.micro_contrast + 0.15), 3),
+            face_weight=current_recipe.face_weight,
+            pre_sharpen=current_recipe.pre_sharpen,
+            second_pass_sharpen=round(extra_sharpen, 3),
+        )
 
-    refined_bgr = apply_post_upscale_4k_camera_polish(after_bgr, updated_recipe)
-    refined_metrics = analyze_frame(refined_bgr)
+        candidate_bgr = apply_post_upscale_4k_camera_polish(best_bgr, current_recipe)
+        candidate_metrics = analyze_frame(candidate_bgr)
+        if candidate_metrics.overall_score >= best_metrics.overall_score:
+            best_bgr = candidate_bgr
+            best_metrics = candidate_metrics
 
-    if refined_metrics.overall_score >= after_metrics.overall_score:
-        return refined_bgr, before_metrics, refined_metrics, updated_recipe, True
-    return after_bgr, before_metrics, after_metrics, updated_recipe, True
+        if (
+            best_metrics.overall_score >= target_score
+            and best_metrics.sharpness >= 80.0
+            and best_metrics.face_clarity >= 80.0
+            and not best_metrics.deficiencies
+        ):
+            break
+
+    return best_bgr, before_metrics, best_metrics, current_recipe, True
 
 
 def _resize_to_height(bgr: np.ndarray, target_h: int) -> np.ndarray:

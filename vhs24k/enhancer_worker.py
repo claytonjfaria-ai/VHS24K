@@ -40,13 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to cloned xinntao/Real-ESRGAN repository.",
     )
     parser.add_argument("--tile", type=int, default=512, help="Tile size (default: 512).")
-    parser.add_argument("--dn", type=float, default=0.35, help="Denoise strength for general-v3.")
+    parser.add_argument("--dn", type=float, default=0.20, help="Denoise strength for general-v3.")
     parser.add_argument("--face-enhance", action="store_true", help="Enable GFPGAN face restoration.")
     parser.add_argument(
         "--face-weight",
         type=float,
-        default=0.80,
-        help="GFPGAN blending weight in [0.0, 1.0] (default: 0.80).",
+        default=0.90,
+        help="GFPGAN blending weight in [0.0, 1.0] (default: 0.90).",
     )
     parser.add_argument("--fp32", action="store_true", help="Use FP32 instead of FP16.")
     parser.add_argument(
@@ -106,10 +106,15 @@ def _sample_chunk_metrics(
     input_path: Path,
     total_frames: int,
     base_face_weight: float,
-) -> Any:
-    """Sample up to 5 evenly-spaced frames and derive a scene ``EnhancementRecipe``."""
+) -> tuple[Any, tuple[int, int, int, int]]:
+    """Sample up to 5 evenly-spaced frames, lock overscan crop, and derive ``EnhancementRecipe``."""
     import cv2  # type: ignore[import-not-found]
-    from vhs24k.quality_review import analyze_frame, derive_enhancement_recipe
+    from vhs24k.quality_review import (
+        analyze_frame,
+        apply_overscan_crop,
+        compute_safe_overscan_crop,
+        derive_enhancement_recipe,
+    )
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -122,18 +127,24 @@ def _sample_chunk_metrics(
         else:
             indices = [0]
 
-        metrics_list: list[Any] = []
+        sampled_frames: list[Any] = []
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if ok and frame is not None:
-                metrics_list.append(analyze_frame(frame))
+                sampled_frames.append(frame)
 
-        if not metrics_list:
+        if not sampled_frames:
             raise RuntimeError(f"Failed to sample any frames from {input_path}")
 
+        crop_box = compute_safe_overscan_crop(sampled_frames)
+        metrics_list = [
+            analyze_frame(apply_overscan_crop(frame, crop_box))
+            for frame in sampled_frames
+        ]
         avg_metrics = _average_metrics(metrics_list)
-        return derive_enhancement_recipe(avg_metrics, base_face_weight=base_face_weight)
+        recipe = derive_enhancement_recipe(avg_metrics, base_face_weight=base_face_weight)
+        return recipe, crop_box
     finally:
         cap.release()
 
@@ -296,19 +307,24 @@ def process_chunk(args: argparse.Namespace) -> Path:
         raise RuntimeError(f"Invalid video dimensions ({width}x{height}) for {input_path}")
 
     recipe = None
+    crop_box: tuple[int, int, int, int] = (0, height, 0, width)
     if args.quality_review:
         from vhs24k.quality_review import (
+            apply_overscan_crop,
             apply_post_upscale_4k_camera_polish,
             apply_pre_upscale_color_and_lighting,
             closed_loop_review_and_refine,
             save_comparison_and_report,
         )
 
-        recipe = _sample_chunk_metrics(input_path, total_frames, args.face_weight)
+        recipe, crop_box = _sample_chunk_metrics(input_path, total_frames, args.face_weight)
 
     upsampler, face_enhancer = _init_upsampler(args)
 
-    out_w, out_h = width * 4, height * 4
+    y0, y1, x0, x1 = crop_box
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    out_w, out_h = crop_w * 4, crop_h * 4
     ffmpeg_proc = _open_ffmpeg_writer(output_file, out_w, out_h, fps)
     if ffmpeg_proc.stdin is None:
         raise RuntimeError("Failed to open FFmpeg stdin pipe.")
@@ -325,6 +341,7 @@ def process_chunk(args: argparse.Namespace) -> Path:
                 break
 
             if args.quality_review and recipe is not None:
+                raw_frame = apply_overscan_crop(raw_frame, crop_box)
                 pre_frame = apply_pre_upscale_color_and_lighting(raw_frame, recipe)
             else:
                 pre_frame = raw_frame
@@ -367,6 +384,7 @@ def process_chunk(args: argparse.Namespace) -> Path:
                     )
                     print(
                         f"[Quality Review] {input_path.stem}: "
+                        f"Trimmed overscan: {width}x{height} -> {crop_w}x{crop_h} | "
                         f"Before={before_metrics.overall_score:.1f}/100 -> "
                         f"After={after_metrics.overall_score:.1f}/100 "
                         f"({after_metrics.grade}) | "

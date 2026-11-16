@@ -196,9 +196,9 @@ def build_deinterlace_denoise_filter(cfg: PipelineConfig) -> str:
 
     if cfg.denoise_strength > 0.0:
         s = cfg.denoise_strength
-        luma_s = round(4.0 * s, 2)
-        chroma_s = round(3.0 * s, 2)
-        luma_t = round(6.0 * s, 2)
+        luma_s = round(1.8 * s, 2)
+        chroma_s = round(3.5 * s, 2)
+        luma_t = round(4.5 * s, 2)
         chroma_t = round(4.5 * s, 2)
         filters.append(f"hqdn3d={luma_s}:{chroma_s}:{luma_t}:{chroma_t}")
 
@@ -224,6 +224,8 @@ def _is_manifest_prepared(manifest_path: Path, cfg: PipelineConfig | None = None
         if data.get("model_name") != cfg.model_name:
             return False
         if data.get("quality_review") != cfg.quality_review:
+            return False
+        if data.get("target_4k_mode") != cfg.target_4k_mode:
             return False
     chunks = data.get("chunks")
     if not chunks:
@@ -343,6 +345,7 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         "test_start_seconds": cfg.test_start_seconds if cfg.test_clip_seconds is not None else 0,
         "model_name": cfg.model_name,
         "quality_review": cfg.quality_review,
+        "target_4k_mode": cfg.target_4k_mode,
         "planned_commands": {
             "video": video_cmd,
             "audio": audio_cmd,

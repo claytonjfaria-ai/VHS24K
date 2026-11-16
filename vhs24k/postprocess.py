@@ -19,14 +19,18 @@ def build_4k_scale_filter(
 ) -> str:
     """Build the FFmpeg -vf filter string for 4K scaling and optional pillarboxing.
 
+    - ``fullscreen_uhd``: scales to full-screen 3840x2160 with final 4K luma acutance and SAR=1.
     - ``pillarbox_uhd``: scales height to 2160 preserving DAR (e.g. 2880x2160 for 4:3)
       and pads to 3840x2160 centered with black bars, setting SAR=1.
     - ``native_4x``: scales to DAR-corrected 2160p (e.g. 2880x2160 for 4:3) with SAR=1.
     """
-    if target_mode not in ("pillarbox_uhd", "native_4x"):
+    if target_mode not in ("fullscreen_uhd", "pillarbox_uhd", "native_4x"):
         raise ValueError(f"Unsupported target_4k_mode: {target_mode!r}")
     if dar_width <= 0 or dar_height <= 0:
         raise ValueError(f"DAR dimensions must be positive, got {dar_width}:{dar_height}")
+
+    if target_mode == "fullscreen_uhd":
+        return f"scale={UHD_WIDTH}:{UHD_HEIGHT}:flags=lanczos,unsharp=5:5:0.85:3:3:0.0,setsar=1"
 
     scaled_w = round(UHD_HEIGHT * dar_width / dar_height)
     if scaled_w % 2 != 0:

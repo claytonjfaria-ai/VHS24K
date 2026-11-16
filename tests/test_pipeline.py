@@ -22,9 +22,11 @@ from vhs24k.quality_review import (
     EnhancementRecipe,
     FrameQualityMetrics,
     analyze_frame,
+    apply_overscan_crop,
     apply_post_upscale_4k_camera_polish,
     apply_pre_upscale_color_and_lighting,
     closed_loop_review_and_refine,
+    compute_safe_overscan_crop,
     derive_enhancement_recipe,
     save_comparison_and_report,
 )
@@ -59,14 +61,14 @@ class TestPipelineConfig:
         assert isinstance(cfg.realesrgan_dir, Path)
         assert cfg.source_mode == "auto"
         assert cfg.deinterlace == "bwdif"
-        assert cfg.denoise_strength == 0.35
+        assert cfg.denoise_strength == 0.20
         assert cfg.model_name == "RealESRGAN_x4plus"
         assert cfg.face_enhance is True
-        assert cfg.face_weight == 0.8
+        assert cfg.face_weight == 0.90
         assert cfg.tile_size == 512
         assert cfg.fp16 is True
         assert cfg.chunk_seconds == 60
-        assert cfg.target_4k_mode == "pillarbox_uhd"
+        assert cfg.target_4k_mode == "fullscreen_uhd"
         assert cfg.crf == 14
         assert cfg.preset == "medium"
         assert cfg.num_gpus == 2
@@ -165,11 +167,11 @@ class TestFilters:
             work_dir=tmp_path,
             output_dir=tmp_path,
             deinterlace="bwdif",
-            denoise_strength=0.35,
+            denoise_strength=0.20,
         )
         assert (
             build_deinterlace_denoise_filter(cfg_bwdif)
-            == "bwdif=mode=0:parity=auto:deint=all,hqdn3d=1.4:1.05:2.1:1.57"
+            == "bwdif=mode=0:parity=auto:deint=all,hqdn3d=0.36:0.7:0.9:0.9"
         )
 
         cfg_yadif = PipelineConfig(
@@ -191,6 +193,10 @@ class TestFilters:
         assert build_deinterlace_denoise_filter(cfg_none) == ""
 
     def test_4k_scale_filter_modes(self) -> None:
+        assert (
+            build_4k_scale_filter("fullscreen_uhd", 4, 3)
+            == "scale=3840:2160:flags=lanczos,unsharp=5:5:0.85:3:3:0.0,setsar=1"
+        )
         assert build_4k_scale_filter("pillarbox_uhd", 4, 3) == (
             "scale=2880:2160:flags=lanczos,"
             "pad=3840:2160:(ow-iw)/2:(oh-ih)/2:black,"
@@ -267,7 +273,7 @@ class TestRealESRGANCommand:
         )
         assert "vhs24k.enhancer_worker" in cmd_default
         assert cmd_default[cmd_default.index("-n") + 1] == "RealESRGAN_x4plus"
-        assert cmd_default[cmd_default.index("--face-weight") + 1] == "0.8"
+        assert cmd_default[cmd_default.index("--face-weight") + 1] == "0.9"
         assert cmd_default[cmd_default.index("--target-quality-score") + 1] == "82.0"
         assert "--face-enhance" in cmd_default
         assert "--fp32" not in cmd_default
@@ -379,6 +385,11 @@ class TestManifestCompatibilityAndDryRun:
 class TestCLI:
     def test_argument_parsing(self, tmp_path: Path) -> None:
         parser = cli.build_parser()
+        default_args = parser.parse_args(["run"])
+        default_cfg = cli._config_from_args(default_args)
+        assert default_cfg.face_weight == 0.9
+        assert default_cfg.target_4k_mode == "fullscreen_uhd"
+
         args = parser.parse_args(
             [
                 "run",
@@ -464,13 +475,17 @@ def _make_synthetic_vhs_frame(height: int = 120, width: int = 160) -> np.ndarray
 
 
 def _make_textured_frame(height: int = 120, width: int = 160) -> np.ndarray:
-    """Create a high-contrast, sharp checkerboard-textured BGR frame."""
+    """Create a high-contrast, sharp, full-dynamic-range BGR frame with no deficiencies."""
     yy, xx = np.mgrid[0:height, 0:width]
-    pattern = (((yy // 4) + (xx // 4)) % 2) * 180 + 35
-    # Add colorful vertical gradient so colorfulness & dynamic range are high
-    b = np.clip(pattern + (xx % 40) - 20, 0, 255).astype(np.uint8)
-    g = np.clip(pattern, 0, 255).astype(np.uint8)
-    r = np.clip(pattern + (yy % 40) - 20, 0, 255).astype(np.uint8)
+    ramp = (yy / max(height - 1, 1)) * 120.0 + 40.0
+    fine = (((yy // 2) + (xx // 2)) % 2) * 75.0 - 37.5
+    base = np.clip(ramp + fine, 20, 235)
+    # Smooth, low-frequency color variation (zero chroma noise, colorfulness > 25, zero cast)
+    color_shift_x = np.sin(2.0 * np.pi * xx / max(width, 1)) * 28.0
+    color_shift_y = np.sin(2.0 * np.pi * yy / max(height, 1)) * 28.0
+    b = np.clip(base + color_shift_x, 0, 255).astype(np.uint8)
+    g = np.clip(base, 0, 255).astype(np.uint8)
+    r = np.clip(base + color_shift_y, 0, 255).astype(np.uint8)
     return np.stack([b, g, r], axis=-1)
 
 
@@ -516,8 +531,9 @@ class TestQualityReview:
         assert recipe.clahe_clip_limit == 2.4
         assert recipe.vibrance_boost == 0.40
         assert recipe.chroma_denoise == 0.75
-        assert recipe.micro_contrast == 0.62
-        assert recipe.face_weight == 0.85
+        assert recipe.micro_contrast == 0.85
+        assert recipe.pre_sharpen == 0.55
+        assert recipe.face_weight == 0.92
 
         clean_metrics = FrameQualityMetrics(
             sharpness=90.0,
@@ -599,3 +615,24 @@ class TestQualityReview:
         assert "recipe" in payload
         if "comparison_jpg" in saved:
             assert Path(saved["comparison_jpg"]).is_file()
+
+    def test_overscan_crop_trims_black_borders_conservatively(self) -> None:
+        h, w = 480, 720
+        frame = np.full((h, w, 3), 140, dtype=np.uint8)
+        # Simulate black VHS overscan edges & bottom head-switching noise bar
+        frame[:, :20, :] = 0
+        frame[:, -22:, :] = 0
+        frame[:12, :, :] = 0
+        frame[-20:, :, :] = 0
+
+        y0, y1, x0, x1 = compute_safe_overscan_crop([frame])
+        assert x0 > 0 and x0 <= int(w * 0.045) + 1
+        assert (w - x1) > 0 and (w - x1) <= int(w * 0.045) + 1
+        assert y0 > 0 and y0 <= int(h * 0.035) + 1
+        assert (h - y1) > 0 and (h - y1) <= int(h * 0.055) + 1
+
+        cropped = apply_overscan_crop(frame, (y0, y1, x0, x1))
+        ch, cw = cropped.shape[:2]
+        assert ch % 2 == 0 and cw % 2 == 0
+        assert ch < h and cw < w
+        assert apply_overscan_crop(frame, None).shape == frame.shape
