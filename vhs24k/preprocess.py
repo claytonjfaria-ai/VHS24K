@@ -254,6 +254,48 @@ def _build_ffmpeg_input_args(source: SourceGroup, concat_file: Path) -> list[str
     return ["-f", "concat", "-safe", "0", "-i", str(concat_file)]
 
 
+def _resolve_test_seek_and_input(
+    source: SourceGroup,
+    cfg: PipelineConfig,
+    concat_file: Path,
+) -> tuple[list[str], list[str]]:
+    """Resolve FFmpeg seek and input arguments, avoiding VOB concat timestamp resets."""
+    seek_args = (
+        ["-ss", str(cfg.test_start_seconds)]
+        if (cfg.test_clip_seconds is not None and cfg.test_start_seconds > 0)
+        else []
+    )
+    input_args = _build_ffmpeg_input_args(source, concat_file)
+
+    if cfg.dry_run or cfg.test_clip_seconds is None or len(source.files) <= 1:
+        return seek_args, input_args
+
+    target_ss = max(0, int(cfg.test_start_seconds))
+    clip_len = int(cfg.test_clip_seconds)
+    accumulated = 0.0
+
+    for file_path in source.files:
+        try:
+            dur = probe_video(file_path).duration
+        except (FileNotFoundError, RuntimeError, ValueError):
+            dur = 0.0
+
+        if dur <= 0.0:
+            mid_file = source.files[len(source.files) // 2]
+            return ["-ss", "180"], ["-i", str(mid_file)]
+
+        if accumulated + dur > target_ss:
+            remaining = target_ss - accumulated
+            max_safe_start = max(0.0, dur - (clip_len + 5))
+            local_ss = int(min(remaining, max_safe_start))
+            return ["-ss", str(max(0, local_ss))], ["-i", str(file_path)]
+
+        accumulated += dur
+
+    mid_file = source.files[len(source.files) // 2]
+    return ["-ss", "180"], ["-i", str(mid_file)]
+
+
 def _run_ffmpeg(cmd: list[str]) -> None:
     """Execute an FFmpeg command and raise a clear error on failure."""
     try:
@@ -292,10 +334,11 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         if not cfg.dry_run:
             raise
 
-    input_args = _build_ffmpeg_input_args(source, source_dir / "concat_input.txt")
+    seek_args, input_args = _resolve_test_seek_and_input(
+        source, cfg, source_dir / "concat_input.txt"
+    )
     vf_filter = build_deinterlace_denoise_filter(cfg)
 
-    seek_args = ["-ss", str(cfg.test_start_seconds)] if (cfg.test_clip_seconds is not None and cfg.test_start_seconds > 0) else []
     video_cmd: list[str] = ["ffmpeg", "-y", *seek_args, *input_args]
     if cfg.test_clip_seconds is not None:
         video_cmd.extend(["-t", str(cfg.test_clip_seconds)])

@@ -45,6 +45,12 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
         help="Source discovery mode (default: auto).",
     )
     parser.add_argument(
+        "--source-name",
+        type=str,
+        default=None,
+        help="Optional source group name to process (e.g. VTS_01 or VTS_02).",
+    )
+    parser.add_argument(
         "--model",
         default="RealESRGAN_x4plus",
         help="Real-ESRGAN model name (default: RealESRGAN_x4plus).",
@@ -86,8 +92,8 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--test-start",
         type=int,
-        default=120,
-        help="Start offset in seconds when using --test-clip (default: 120s to skip VHS intro leader).",
+        default=1200,
+        help="Start offset in seconds when using --test-clip (default: 1200s to sample near the middle of the video).",
     )
     parser.add_argument(
         "--num-gpus",
@@ -161,6 +167,8 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         extra["quality_review"] = not args.no_quality_review
     if "target_quality_score" in field_names:
         extra["target_quality_score"] = args.target_quality_score
+    if "source_name" in field_names:
+        extra["source_name"] = args.source_name
 
     return PipelineConfig(
         input_dir=args.input_dir,
@@ -208,8 +216,19 @@ def _cmd_inspect(cfg: PipelineConfig) -> int:
     return 0
 
 
+def _filter_sources(sources: list, cfg: PipelineConfig) -> list:
+    """Filter discovered sources by ``cfg.source_name`` when provided."""
+    source_name = getattr(cfg, "source_name", None)
+    if source_name is not None:
+        filtered = [s for s in sources if s.name.lower() == source_name.lower()]
+        if not filtered:
+            raise ValueError(f"Source group {source_name!r} not found.")
+        return filtered
+    return sources
+
+
 def _cmd_prepare(cfg: PipelineConfig) -> int:
-    sources = discover_sources(cfg.input_dir, cfg.source_mode)
+    sources = _filter_sources(discover_sources(cfg.input_dir, cfg.source_mode), cfg)
     for src in sources:
         manifest_path = prepare_chunks(src, cfg.work_dir, cfg)
         print(f"Prepared: {manifest_path}")
@@ -235,8 +254,11 @@ def _cmd_assemble(cfg: PipelineConfig) -> int:
 
 def _cmd_run(cfg: PipelineConfig) -> int:
     sources = discover_sources(cfg.input_dir, cfg.source_mode)
-    if cfg.test_clip_seconds is not None:
-        sources = sources[:1]
+    if getattr(cfg, "source_name", None) is not None:
+        sources = _filter_sources(sources, cfg)
+    elif cfg.test_clip_seconds is not None:
+        vts02 = [s for s in sources if s.name.lower() == "vts_02"]
+        sources = vts02 if vts02 else sources[:1]
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     for src in sources:
         manifest_path = prepare_chunks(src, cfg.work_dir, cfg)

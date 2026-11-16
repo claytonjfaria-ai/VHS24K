@@ -14,6 +14,8 @@ from vhs24k.postprocess import assemble_final, build_4k_scale_filter
 from vhs24k.preprocess import (
     MIN_SOURCE_BYTES,
     SourceGroup,
+    VideoInfo,
+    _resolve_test_seek_and_input,
     build_deinterlace_denoise_filter,
     discover_sources,
     prepare_chunks,
@@ -73,6 +75,8 @@ class TestPipelineConfig:
         assert cfg.preset == "medium"
         assert cfg.num_gpus == 2
         assert cfg.test_clip_seconds is None
+        assert cfg.test_start_seconds == 1200
+        assert cfg.source_name is None
         assert cfg.dry_run is False
         assert cfg.quality_review is True
         assert cfg.target_quality_score == 82.0
@@ -327,6 +331,54 @@ class TestManifestCompatibilityAndDryRun:
         assert "15" in manifest["planned_commands"]["video"]
         assert f"concat:{vob1}|{vob2}" in manifest["planned_commands"]["video"]
 
+    def test_resolve_test_seek_and_input_multifile_vob(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        vob1 = _make_file(tmp_path / "in" / "VTS_02_1.VOB", MIN_SOURCE_BYTES + 10)
+        vob2 = _make_file(tmp_path / "in" / "VTS_02_2.VOB", MIN_SOURCE_BYTES + 10)
+        vob3 = _make_file(tmp_path / "in" / "VTS_02_3.VOB", MIN_SOURCE_BYTES + 10)
+        source = SourceGroup(name="VTS_02", files=[vob1, vob2, vob3], source_type="vob")
+        concat_file = tmp_path / "work" / "VTS_02" / "concat_input.txt"
+
+        cfg = PipelineConfig(
+            input_dir=tmp_path / "in",
+            work_dir=tmp_path / "work",
+            output_dir=tmp_path / "out",
+            test_clip_seconds=15,
+            test_start_seconds=1200,
+            dry_run=False,
+        )
+
+        # Case 1: Duration walk across VOBs (600s + 700s + 500s -> target 1200s lands at +600s in vob2)
+        durations = {vob1: 600.0, vob2: 700.0, vob3: 500.0}
+
+        def fake_probe(path: Path) -> VideoInfo:
+            return VideoInfo(
+                path=path,
+                width=720,
+                height=480,
+                fps=29.97,
+                duration=durations[path],
+                is_interlaced=True,
+                dar="4:3",
+                sar="8:9",
+                audio_codec="ac3",
+            )
+
+        monkeypatch.setattr("vhs24k.preprocess.probe_video", fake_probe)
+        seek_args, input_args = _resolve_test_seek_and_input(source, cfg, concat_file)
+        assert seek_args == ["-ss", "600"]
+        assert input_args == ["-i", str(vob2)]
+
+        # Case 2: Probe failure falls back to middle file with -ss 180
+        def failing_probe(path: Path) -> VideoInfo:
+            raise RuntimeError("ffprobe unavailable")
+
+        monkeypatch.setattr("vhs24k.preprocess.probe_video", failing_probe)
+        fb_seek, fb_input = _resolve_test_seek_and_input(source, cfg, concat_file)
+        assert fb_seek == ["-ss", "180"]
+        assert fb_input == ["-i", str(vob2)]
+
     def test_upscale_and_postprocess_manifest_schema(self, tmp_path: Path) -> None:
         source_dir = tmp_path / "work" / "VTS_01"
         chunks_dir = source_dir / "chunks"
@@ -389,6 +441,8 @@ class TestCLI:
         default_cfg = cli._config_from_args(default_args)
         assert default_cfg.face_weight == 0.9
         assert default_cfg.target_4k_mode == "fullscreen_uhd"
+        assert default_cfg.test_start_seconds == 1200
+        assert default_cfg.source_name is None
 
         args = parser.parse_args(
             [
@@ -401,6 +455,8 @@ class TestCLI:
                 str(tmp_path / "out"),
                 "--source-mode",
                 "vob",
+                "--source-name",
+                "VTS_02",
                 "--model",
                 "RealESRGAN_x4plus",
                 "--no-face-enhance",
@@ -413,6 +469,8 @@ class TestCLI:
                 "30",
                 "--test-clip",
                 "15",
+                "--test-start",
+                "1200",
                 "--num-gpus",
                 "1",
                 "--4k-mode",
@@ -423,6 +481,7 @@ class TestCLI:
         cfg = cli._config_from_args(args)
         assert args.command == "run"
         assert cfg.source_mode == "vob"
+        assert cfg.source_name == "VTS_02"
         assert cfg.model_name == "RealESRGAN_x4plus"
         assert cfg.face_enhance is False
         assert cfg.face_weight == 0.65
@@ -430,6 +489,7 @@ class TestCLI:
         assert cfg.target_quality_score == 88.5
         assert cfg.chunk_seconds == 30
         assert cfg.test_clip_seconds == 15
+        assert cfg.test_start_seconds == 1200
         assert cfg.num_gpus == 1
         assert cfg.target_4k_mode == "native_4x"
         assert cfg.dry_run is True
