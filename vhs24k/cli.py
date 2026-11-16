@@ -63,7 +63,13 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
         "--test-clip",
         type=int,
         default=None,
-        help="Process only the first N seconds as a quick quality test.",
+        help="Process only a short N-second clip as a quick quality test.",
+    )
+    parser.add_argument(
+        "--test-start",
+        type=int,
+        default=120,
+        help="Start offset in seconds when using --test-clip (default: 120s to skip VHS intro leader).",
     )
     parser.add_argument(
         "--num-gpus",
@@ -142,6 +148,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         target_4k_mode=args.target_4k_mode,
         num_gpus=args.num_gpus,
         test_clip_seconds=args.test_clip,
+        test_start_seconds=args.test_start,
         realesrgan_dir=args.realesrgan_dir,
         dry_run=args.dry_run,
     )

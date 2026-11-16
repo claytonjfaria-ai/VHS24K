@@ -28,6 +28,7 @@ class PipelineConfig:
     preset: str = "medium"
     num_gpus: int = 2
     test_clip_seconds: int | None = None
+    test_start_seconds: int = 120
     realesrgan_dir: Path | None = None
     dry_run: bool = False
 

@@ -143,7 +143,7 @@ def assemble_final(manifest_path: Path, output_path: Path, cfg: PipelineConfig) 
     vf_filter = build_4k_scale_filter(cfg.target_4k_mode, dar_w, dar_h)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    primary_codec = "libx265" if _has_encoder("libx265") else "libx264"
+    primary_codec = "libx264"
     cmd = _build_assemble_command(concat_file, audio_path, vf_filter, primary_codec, output_path, cfg)
 
     if cfg.dry_run:

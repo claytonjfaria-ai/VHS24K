@@ -205,7 +205,7 @@ def build_deinterlace_denoise_filter(cfg: PipelineConfig) -> str:
     return ",".join(filters)
 
 
-def _is_manifest_prepared(manifest_path: Path) -> bool:
+def _is_manifest_prepared(manifest_path: Path, cfg: PipelineConfig | None = None) -> bool:
     """Return True if an existing manifest has all prepared chunk files on disk."""
     if not manifest_path.is_file():
         return False
@@ -216,6 +216,11 @@ def _is_manifest_prepared(manifest_path: Path) -> bool:
 
     if data.get("status") not in ("prepared", "done"):
         return False
+    if cfg is not None:
+        if data.get("test_clip_seconds") != cfg.test_clip_seconds:
+            return False
+        if cfg.test_clip_seconds is not None and data.get("test_start_seconds") != cfg.test_start_seconds:
+            return False
     chunks = data.get("chunks")
     if not chunks:
         return False
@@ -267,7 +272,7 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
     upscaled_dir = source_dir / "upscaled"
     manifest_path = source_dir / "manifest.json"
 
-    if not cfg.dry_run and _is_manifest_prepared(manifest_path):
+    if not cfg.dry_run and _is_manifest_prepared(manifest_path, cfg):
         return manifest_path
 
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -284,7 +289,8 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
     input_args = _build_ffmpeg_input_args(source, source_dir / "concat_input.txt")
     vf_filter = build_deinterlace_denoise_filter(cfg)
 
-    video_cmd: list[str] = ["ffmpeg", "-y", *input_args]
+    seek_args = ["-ss", str(cfg.test_start_seconds)] if (cfg.test_clip_seconds is not None and cfg.test_start_seconds > 0) else []
+    video_cmd: list[str] = ["ffmpeg", "-y", *seek_args, *input_args]
     if cfg.test_clip_seconds is not None:
         video_cmd.extend(["-t", str(cfg.test_clip_seconds)])
     if vf_filter:
@@ -318,7 +324,7 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
     audio_path = source_dir / "audio.mka"
     audio_cmd: list[str] | None = None
     if has_audio:
-        audio_cmd = ["ffmpeg", "-y", *input_args]
+        audio_cmd = ["ffmpeg", "-y", *seek_args, *input_args]
         if cfg.test_clip_seconds is not None:
             audio_cmd.extend(["-t", str(cfg.test_clip_seconds)])
         audio_cmd.extend(["-vn", "-c:a", "copy", str(audio_path)])
@@ -329,6 +335,8 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         "source_files": [str(p) for p in source.files],
         "video_info": video_info.to_dict() if video_info else None,
         "audio_path": str(audio_path) if audio_cmd else None,
+        "test_clip_seconds": cfg.test_clip_seconds,
+        "test_start_seconds": cfg.test_start_seconds if cfg.test_clip_seconds is not None else 0,
         "planned_commands": {
             "video": video_cmd,
             "audio": audio_cmd,
