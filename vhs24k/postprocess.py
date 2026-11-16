@@ -30,7 +30,7 @@ def build_4k_scale_filter(
         raise ValueError(f"DAR dimensions must be positive, got {dar_width}:{dar_height}")
 
     if target_mode == "fullscreen_uhd":
-        return f"scale={UHD_WIDTH}:{UHD_HEIGHT}:flags=lanczos,unsharp=5:5:0.85:3:3:0.0,setsar=1"
+        return f"scale={UHD_WIDTH}:{UHD_HEIGHT}:flags=lanczos,setsar=1"
 
     scaled_w = round(UHD_HEIGHT * dar_width / dar_height)
     if scaled_w % 2 != 0:

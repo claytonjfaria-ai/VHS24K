@@ -30,8 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-n",
         "--model-name",
-        default="RealESRGAN_x4plus",
-        help="Super-resolution model name (default: RealESRGAN_x4plus).",
+        default="realesr-general-x4v3",
+        help="Super-resolution model name (default: realesr-general-x4v3).",
     )
     parser.add_argument(
         "--realesrgan-dir",
@@ -40,13 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to cloned xinntao/Real-ESRGAN repository.",
     )
     parser.add_argument("--tile", type=int, default=512, help="Tile size (default: 512).")
-    parser.add_argument("--dn", type=float, default=0.20, help="Denoise strength for general-v3.")
+    parser.add_argument("--dn", type=float, default=0.65, help="Denoise strength for general-v3 (default: 0.65).")
     parser.add_argument("--face-enhance", action="store_true", help="Enable GFPGAN face restoration.")
     parser.add_argument(
         "--face-weight",
         type=float,
-        default=0.90,
-        help="GFPGAN blending weight in [0.0, 1.0] (default: 0.90).",
+        default=0.85,
+        help="GFPGAN blending weight in [0.0, 1.0] (default: 0.85).",
     )
     parser.add_argument("--fp32", action="store_true", help="Use FP32 instead of FP16.")
     parser.add_argument(
@@ -188,24 +188,33 @@ def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
             upscale=4,
             act_type="prelu",
         )
-        main_w = realesrgan_dir / "weights" / "realesr-general-x4v3.pth"
-        wdn_w = realesrgan_dir / "weights" / "realesr-general-wdn-x4v3.pth"
-        main_path = (
-            str(main_w)
-            if main_w.exists()
-            else "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-        )
-        wdn_path = (
-            str(wdn_w)
-            if wdn_w.exists()
-            else "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth"
-        )
-        if args.dn != 1.0:
-            model_path = [main_path, wdn_path]
-            dni_weight = [args.dn, 1.0 - args.dn]
-        else:
-            model_path = main_path
+        weights_dir = realesrgan_dir / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        main_w = weights_dir / "realesr-general-x4v3.pth"
+        wdn_w = weights_dir / "realesr-general-wdn-x4v3.pth"
+        if not main_w.exists():
+            import urllib.request
+
+            urllib.request.urlretrieve(
+                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+                main_w,
+            )
+        if not wdn_w.exists():
+            import urllib.request
+
+            urllib.request.urlretrieve(
+                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+                wdn_w,
+            )
+        if args.dn <= 0.0:
+            model_path = str(main_w)
             dni_weight = None
+        elif args.dn >= 1.0:
+            model_path = str(wdn_w)
+            dni_weight = None
+        else:
+            model_path = [str(main_w), str(wdn_w)]
+            dni_weight = [1.0 - args.dn, args.dn]
     else:
         raise ValueError(f"Unsupported model_name for enhancer_worker: {args.model_name!r}")
 
@@ -242,7 +251,7 @@ def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
 
 
 def _open_ffmpeg_writer(output_file: Path, width: int, height: int, fps: float) -> subprocess.Popen[bytes]:
-    """Open an FFmpeg rawvideo pipe writer encoding at near-lossless CRF 12."""
+    """Open an FFmpeg rawvideo pipe writer encoding at CRF 16."""
     cmd = [
         "ffmpeg",
         "-y",
@@ -259,7 +268,7 @@ def _open_ffmpeg_writer(output_file: Path, width: int, height: int, fps: float) 
         "-c:v",
         "libx264",
         "-crf",
-        "12",
+        "16",
         "-preset",
         "fast",
         "-pix_fmt",
@@ -409,7 +418,7 @@ def process_chunk(args: argparse.Namespace) -> Path:
                         flush=True,
                     )
                     reviewed = True
-                post_frame = temporal_smooth_4k_frame(post_frame, prev_4k_frame, strength=0.30)
+                post_frame = temporal_smooth_4k_frame(post_frame, prev_4k_frame, strength=0.48)
                 prev_4k_frame = post_frame
             else:
                 post_frame = upscaled_frame

@@ -195,13 +195,13 @@ def build_deinterlace_denoise_filter(cfg: PipelineConfig) -> str:
         raise ValueError(f"Unsupported deinterlace mode: {cfg.deinterlace!r}")
 
     if cfg.denoise_strength > 0.0:
-        filters.append("atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08")
+        filters.append("atadenoise=0a=0.06:0b=0.12:1a=0.06:1b=0.12:2a=0.06:2b=0.12")
         filters.append("deflicker=size=5:mode=am")
         s = cfg.denoise_strength
-        luma_s = round(1.8 * s, 2)
-        chroma_s = round(3.5 * s, 2)
-        luma_t = round(4.5 * s, 2)
-        chroma_t = round(4.5 * s, 2)
+        luma_s = round(3.5 * s, 2)
+        chroma_s = round(4.5 * s, 2)
+        luma_t = round(6.0 * s, 2)
+        chroma_t = round(6.0 * s, 2)
         filters.append(f"hqdn3d={luma_s}:{chroma_s}:{luma_t}:{chroma_t}")
 
     return ",".join(filters)
@@ -228,6 +228,8 @@ def _is_manifest_prepared(manifest_path: Path, cfg: PipelineConfig | None = None
         if data.get("quality_review") != cfg.quality_review:
             return False
         if data.get("target_4k_mode") != cfg.target_4k_mode:
+            return False
+        if data.get("denoise_strength") != cfg.denoise_strength:
             return False
     chunks = data.get("chunks")
     if not chunks:
@@ -391,6 +393,7 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         "model_name": cfg.model_name,
         "quality_review": cfg.quality_review,
         "target_4k_mode": cfg.target_4k_mode,
+        "denoise_strength": cfg.denoise_strength,
         "planned_commands": {
             "video": video_cmd,
             "audio": audio_cmd,

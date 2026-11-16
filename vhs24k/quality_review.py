@@ -45,13 +45,13 @@ class FrameQualityMetrics:
 class EnhancementRecipe:
     """Tuned pre-upscale and post-upscale restoration parameters."""
 
-    wb_strength: float = 0.65
-    clahe_clip_limit: float = 1.8
-    vibrance_boost: float = 0.25
-    chroma_denoise: float = 0.50
-    micro_contrast: float = 0.75
-    face_weight: float = 0.90
-    pre_sharpen: float = 0.45
+    wb_strength: float = 0.35
+    clahe_clip_limit: float = 1.25
+    vibrance_boost: float = 0.18
+    chroma_denoise: float = 0.65
+    micro_contrast: float = 0.55
+    face_weight: float = 0.85
+    pre_sharpen: float = 0.0
     second_pass_sharpen: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,8 +221,8 @@ def _ycrcb_to_bgr_np(y: np.ndarray, cr: np.ndarray, cb: np.ndarray) -> np.ndarra
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
-def _laplacian_energy(luma: np.ndarray) -> float:
-    """Compute 90th-percentile absolute 3x3 Laplacian response on a 2D luma array."""
+def _laplacian_energy(luma: np.ndarray, percentile: float = 90.0) -> float:
+    """Compute percentile absolute 3x3 Laplacian response on a 2D luma array."""
     if luma.shape[0] < 3 or luma.shape[1] < 3:
         return 0.0
     lap = (
@@ -232,10 +232,10 @@ def _laplacian_energy(luma: np.ndarray) -> float:
         + luma[1:-1, 2:]
         - 4.0 * luma[1:-1, 1:-1]
     )
-    return float(np.percentile(np.abs(lap), 90))
+    return float(np.percentile(np.abs(lap), percentile))
 
 
-def _tenengrad_energy(luma: np.ndarray) -> float:
+def _tenengrad_energy(luma: np.ndarray, percentile: float = 90.0) -> float:
     """Compute Sobel/Tenengrad gradient magnitude energy."""
     if luma.shape[0] < 3 or luma.shape[1] < 3:
         return 0.0
@@ -248,27 +248,31 @@ def _tenengrad_energy(luma: np.ndarray) -> float:
         - (luma[:-2, :-2] + 2.0 * luma[:-2, 1:-1] + luma[:-2, 2:])
     ) / 8.0
     mag = np.sqrt(gx * gx + gy * gy)
-    return float(np.percentile(mag, 90))
+    return float(np.percentile(mag, percentile))
 
 
 def _multiscale_edge_energy(luma: np.ndarray) -> tuple[float, float]:
-    """Compute (laplacian_energy, tenengrad_energy), taking max across 4K strides when >= 1000px."""
+    """Compute (laplacian_energy, tenengrad_energy) on top structural edges (92nd & 96th pct)."""
     strides = (1, 2, 4) if min(luma.shape) >= 1000 else (1,)
     laps: list[float] = []
     tens: list[float] = []
     for s in strides:
         sub = luma[::s, ::s]
         if min(sub.shape) >= 4:
-            laps.append(_laplacian_energy(sub))
-            tens.append(_tenengrad_energy(sub))
+            laps.append(0.5 * (_laplacian_energy(sub, 92.0) + _laplacian_energy(sub, 96.0)))
+            tens.append(0.5 * (_tenengrad_energy(sub, 92.0) + _tenengrad_energy(sub, 96.0)))
     return (max(laps) if laps else 0.0), (max(tens) if tens else 0.0)
 
 
 def _compute_sharpness(luma: np.ndarray) -> float:
-    """Compute multi-scale sharpness score in [0, 100]."""
+    """Compute multi-scale structural edge sharpness score in [0, 100]."""
     lap_full, ten_full = _multiscale_edge_energy(luma)
     luma_half = luma[::2, ::2]
-    lap_half = _laplacian_energy(luma_half) if min(luma_half.shape) >= 4 else lap_full
+    lap_half = (
+        0.5 * (_laplacian_energy(luma_half, 92.0) + _laplacian_energy(luma_half, 96.0))
+        if min(luma_half.shape) >= 4
+        else lap_full
+    )
 
     energy = 0.45 * lap_full + 0.35 * ten_full + 0.20 * lap_half
     score = 100.0 * (1.0 - float(np.exp(-energy / 16.0)))
@@ -483,18 +487,18 @@ def analyze_frame(frame_bgr: np.ndarray) -> FrameQualityMetrics:
 
 def derive_enhancement_recipe(
     metrics: FrameQualityMetrics,
-    base_face_weight: float = 0.90,
+    base_face_weight: float = 0.85,
 ) -> EnhancementRecipe:
     """Derive a scene-adaptive enhancement recipe from FrameQualityMetrics."""
     defs = set(metrics.deficiencies)
 
-    wb_strength = 0.85 if "vhs_color_cast" in defs else 0.55
-    clahe_clip_limit = 2.4 if "compressed_dynamic_range" in defs else 1.6
-    vibrance_boost = 0.40 if "muted_saturation" in defs else 0.22
-    chroma_denoise = 0.75 if "chroma_noise" in defs else 0.40
-    micro_contrast = 0.85 if "soft_scene_textures" in defs else 0.72
-    pre_sharpen = 0.55 if ("soft_scene_textures" in defs or "soft_faces" in defs) else 0.40
-    face_weight = min(1.0, max(base_face_weight, 0.92)) if "soft_faces" in defs else base_face_weight
+    wb_strength = 0.45 if "vhs_color_cast" in defs else 0.30
+    clahe_clip_limit = 1.40 if "compressed_dynamic_range" in defs else 1.15
+    vibrance_boost = 0.24 if "muted_saturation" in defs else 0.16
+    chroma_denoise = 0.75 if "chroma_noise" in defs else 0.55
+    micro_contrast = 0.65 if "soft_scene_textures" in defs else 0.50
+    pre_sharpen = 0.0
+    face_weight = min(1.0, max(base_face_weight, 0.88)) if "soft_faces" in defs else base_face_weight
 
     return EnhancementRecipe(
         wb_strength=round(wb_strength, 3),
@@ -503,7 +507,7 @@ def derive_enhancement_recipe(
         chroma_denoise=round(chroma_denoise, 3),
         micro_contrast=round(micro_contrast, 3),
         face_weight=round(face_weight, 3),
-        pre_sharpen=round(pre_sharpen, 3),
+        pre_sharpen=pre_sharpen,
         second_pass_sharpen=0.0,
     )
 
@@ -515,7 +519,7 @@ def apply_pre_upscale_color_and_lighting(
     """Clean chroma noise, neutralize VHS color cast, expand dynamic range, and boost vibrance."""
     frame_bgr = _validate_bgr_frame(frame_bgr)
 
-    # 1. Chroma noise/bleed cleanup in YCrCb (Y luma stays 100% sharp)
+    # 1. Chroma noise/bleed cleanup in YCrCb + edge-preserving bilateral luma surface smoothing
     y, cr, cb = _bgr_to_ycrcb_np(frame_bgr)
     if recipe.chroma_denoise > 0.0:
         radius = 2 if recipe.chroma_denoise < 0.65 else 3
@@ -524,6 +528,18 @@ def apply_pre_upscale_color_and_lighting(
         alpha = float(np.clip(recipe.chroma_denoise, 0.0, 1.0))
         cr = cr * (1.0 - alpha) + cr_smooth * alpha
         cb = cb * (1.0 - alpha) + cb_smooth * alpha
+
+    y_s = _smooth_2d(y, 1)
+    gx_y = np.pad(np.abs(y_s[:, 2:] - y_s[:, :-2]) * 0.5, ((0, 0), (1, 1)), mode="edge")
+    gy_y = np.pad(np.abs(y_s[2:, :] - y_s[:-2, :]) * 0.5, ((1, 1), (0, 0)), mode="edge")
+    grad_y = np.hypot(gx_y, gy_y)
+    if cv2 is not None:
+        y_bilat = cv2.bilateralFilter(y.astype(np.float32), d=5, sigmaColor=18.0, sigmaSpace=18.0)
+    else:
+        y_bilat = _smooth_2d(y, 2)
+    edge_weight = np.clip(grad_y / 14.0, 0.25, 1.0)
+    y = y * edge_weight + y_bilat * (1.0 - edge_weight)
+
     work = _ycrcb_to_bgr_np(y, cr, cb).astype(np.float32)
 
     # 2. Highlight-protected Gray-World Auto White Balance
@@ -565,7 +581,7 @@ def apply_pre_upscale_color_and_lighting(
                 tileGridSize=(8, 8),
             )
             l_eq = clahe.apply(l_chan)
-            l_blend = np.clip(0.35 * l_chan.astype(np.float32) + 0.65 * l_eq.astype(np.float32), 0, 255).astype(np.uint8)
+            l_blend = np.clip(0.65 * l_chan.astype(np.float32) + 0.35 * l_eq.astype(np.float32), 0, 255).astype(np.uint8)
             work_u8 = cv2.cvtColor(cv2.merge([l_blend, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
         else:
             y_c, cr_c, cb_c = _bgr_to_ycrcb_np(work_u8)
@@ -575,7 +591,7 @@ def apply_pre_upscale_color_and_lighting(
                 s_strength = float(np.clip((recipe.clahe_clip_limit - 1.0) * 0.25, 0.05, 0.45))
                 y_scurve = y_norm + s_strength * np.sin(2.0 * np.pi * y_norm) * (-0.12)
                 y_stretched = np.clip(y_scurve * 255.0, 0.0, 255.0)
-                y_out = 0.40 * y_c + 0.60 * y_stretched
+                y_out = 0.65 * y_c + 0.35 * y_stretched
                 work_u8 = _ycrcb_to_bgr_np(y_out, cr_c, cb_c)
 
     # 4. Skin-safe Vibrance boost
@@ -608,27 +624,33 @@ def apply_post_upscale_4k_camera_polish(
     frame_bgr: np.ndarray,
     recipe: EnhancementRecipe,
 ) -> np.ndarray:
-    """Apply 4K-scaled multi-band luminance micro-contrast & detail synthesis with halo suppression."""
+    """Apply structure-gated 4K edge acutance with zero sky/water noise amplification."""
     frame_bgr = _validate_bgr_frame(frame_bgr)
     y, cr, cb = _bgr_to_ycrcb_np(frame_bgr)
 
+    y_base = _smooth_2d(y, 3)
+    gx = np.pad(np.abs(y_base[:, 2:] - y_base[:, :-2]) * 0.5, ((0, 0), (1, 1)), mode="edge")
+    gy = np.pad(np.abs(y_base[2:, :] - y_base[:-2, :]) * 0.5, ((1, 1), (0, 0)), mode="edge")
+    grad = np.hypot(gx, gy)
+    edge_gate = np.clip((grad - 3.5) / 12.0, 0.0, 1.0)
+
+    # Ultra-clean flat surfaces (sky, calm water) without touching structural edges
+    y_flat_smooth = _smooth_2d(y, 1)
+    y = np.where(edge_gate < 0.15, 0.8 * y + 0.2 * y_flat_smooth, y)
+
     blur_fine = _smooth_2d(y, 2)
     blur_med = _smooth_2d(y, 5)
-    blur_coarse = _smooth_2d(y, 10)
 
     fine_detail = y - blur_fine
     med_detail = blur_fine - blur_med
-    coarse_detail = blur_med - blur_coarse
 
     g_fine = 1.35 * recipe.micro_contrast + 1.40 * recipe.second_pass_sharpen
-    g_med = 0.95 * recipe.micro_contrast + 1.00 * recipe.second_pass_sharpen
-    g_coarse = 0.45 * recipe.micro_contrast + 0.40 * recipe.second_pass_sharpen
+    g_med = 0.85 * recipe.micro_contrast + 0.90 * recipe.second_pass_sharpen
 
-    delta = g_fine * fine_detail + g_med * med_detail + g_coarse * coarse_detail
-    max_delta = 30.0 + 14.0 * recipe.second_pass_sharpen
-    # Soft-clip / clamp delta to prevent ringing halos and protect extreme highlights/shadows
+    delta = g_fine * fine_detail + g_med * med_detail
+    max_delta = 18.0
     midtone_mask = np.clip(np.minimum(y, 255.0 - y) / 24.0, 0.25, 1.0)
-    delta = np.clip(delta, -max_delta, max_delta) * midtone_mask
+    delta = np.clip(delta, -max_delta, max_delta) * edge_gate * midtone_mask
 
     y_polished = np.clip(y + delta, 0.0, 255.0)
     return _ycrcb_to_bgr_np(y_polished, cr, cb)
@@ -793,6 +815,8 @@ def remove_vhs_white_line_dropouts(
 
     ref_bgr: np.ndarray | None = None
     low_motion: np.ndarray | None = None
+    med_bgr: np.ndarray | None = None
+    temp_noise_mask: np.ndarray | None = None
 
     if valid_prev or valid_next:
         if valid_prev and valid_next:
@@ -800,60 +824,81 @@ def remove_vhs_white_line_dropouts(
             n_v = _validate_bgr_frame(next_bgr)  # type: ignore[arg-type]
             y_prev = _bgr_to_luma(p_v)
             y_next = _bgr_to_luma(n_v)
+            med_bgr = np.median(np.stack([p_v, curr_bgr, n_v], axis=0), axis=0).astype(np.uint8)
+            y_med = _bgr_to_luma(med_bgr)
             ref_bgr = 0.5 * (p_v.astype(np.float32) + n_v.astype(np.float32))
             y_temp_max = np.maximum(y_prev, y_next)
             low_motion = np.abs(y_prev - y_next) < 25.0
+            dropout_mask = ((y - y_temp_max > 12.0) & (vert_spike > 7.0)) | (
+                (vert_spike > 20.0) & (y > 155.0)
+            )
+            temp_spike = np.abs(y - y_med)
+            temp_noise_mask = (np.abs(y_prev - y_next) < 14.0) & (temp_spike > 6.0)
         elif valid_prev:
             p_v = _validate_bgr_frame(prev_bgr)  # type: ignore[arg-type]
             y_prev = _bgr_to_luma(p_v)
             ref_bgr = p_v.astype(np.float32)
             y_temp_max = y_prev
             low_motion = np.abs(y_vert - y_prev) < 25.0
+            dropout_mask = ((y - y_temp_max > 18.0) & (vert_spike > 10.0) & (y > 135.0)) | (
+                (vert_spike > 26.0) & (y > 175.0)
+            )
         else:
             n_v = _validate_bgr_frame(next_bgr)  # type: ignore[arg-type]
             y_next = _bgr_to_luma(n_v)
             ref_bgr = n_v.astype(np.float32)
             y_temp_max = y_next
             low_motion = np.abs(y_vert - y_next) < 25.0
-
-        dropout_mask = ((y - y_temp_max > 18.0) & (vert_spike > 10.0) & (y > 135.0)) | (
-            (vert_spike > 26.0) & (y > 175.0)
-        )
+            dropout_mask = ((y - y_temp_max > 18.0) & (vert_spike > 10.0) & (y > 135.0)) | (
+                (vert_spike > 26.0) & (y > 175.0)
+            )
     else:
         dropout_mask = (vert_spike > 24.0) & (y > 170.0)
 
-    if not np.any(dropout_mask):
+    has_dropouts = bool(np.any(dropout_mask))
+    has_temp_noise = temp_noise_mask is not None and bool(np.any(temp_noise_mask))
+    if not has_dropouts and not has_temp_noise:
         return curr_bgr.copy(), 0
 
-    # Dilate horizontally by 2 pixels and vertically by 1 pixel to cover soft edges
-    pad_h = np.pad(dropout_mask, ((0, 0), (2, 2)), mode="constant", constant_values=False)
-    dilated_h = (
-        pad_h[:, :-4]
-        | pad_h[:, 1:-3]
-        | pad_h[:, 2:-2]
-        | pad_h[:, 3:-1]
-        | pad_h[:, 4:]
-    )
-    pad_v = np.pad(dilated_h, ((1, 1), (0, 0)), mode="constant", constant_values=False)
-    dropout_mask = pad_v[:-2, :] | pad_v[1:-1, :] | pad_v[2:, :]
-
     curr_f = curr_bgr.astype(np.float32)
-    above_bgr = np.pad(curr_f[:-1, :, :], ((1, 0), (0, 0), (0, 0)), mode="edge")
-    below_bgr = np.pad(curr_f[1:, :, :], ((0, 1), (0, 0), (0, 0)), mode="edge")
-    vert_inpaint_bgr = 0.5 * (above_bgr + below_bgr)
+    cleaned = curr_f.copy()
+    masked_count = 0
 
-    if ref_bgr is not None and low_motion is not None:
-        fill_bgr = np.where(
-            low_motion[:, :, None],
-            0.65 * ref_bgr + 0.35 * vert_inpaint_bgr,
-            vert_inpaint_bgr,
+    if has_temp_noise and med_bgr is not None and temp_noise_mask is not None:
+        med_f = med_bgr.astype(np.float32)
+        cleaned = np.where(temp_noise_mask[:, :, None], 0.5 * curr_f + 0.5 * med_f, cleaned)
+
+    if has_dropouts:
+        # Dilate horizontally by 2 pixels and vertically by 1 pixel to cover soft edges
+        pad_h = np.pad(dropout_mask, ((0, 0), (2, 2)), mode="constant", constant_values=False)
+        dilated_h = (
+            pad_h[:, :-4]
+            | pad_h[:, 1:-3]
+            | pad_h[:, 2:-2]
+            | pad_h[:, 3:-1]
+            | pad_h[:, 4:]
         )
-    else:
-        fill_bgr = vert_inpaint_bgr
+        pad_v = np.pad(dilated_h, ((1, 1), (0, 0)), mode="constant", constant_values=False)
+        dropout_mask = pad_v[:-2, :] | pad_v[1:-1, :] | pad_v[2:, :]
+        masked_count = int(np.count_nonzero(dropout_mask))
 
-    cleaned = np.where(dropout_mask[:, :, None], fill_bgr, curr_f)
+        above_bgr = np.pad(curr_f[:-1, :, :], ((1, 0), (0, 0), (0, 0)), mode="edge")
+        below_bgr = np.pad(curr_f[1:, :, :], ((0, 1), (0, 0), (0, 0)), mode="edge")
+        vert_inpaint_bgr = 0.5 * (above_bgr + below_bgr)
+
+        if ref_bgr is not None and low_motion is not None:
+            fill_bgr = np.where(
+                low_motion[:, :, None],
+                0.65 * ref_bgr + 0.35 * vert_inpaint_bgr,
+                vert_inpaint_bgr,
+            )
+        else:
+            fill_bgr = vert_inpaint_bgr
+
+        cleaned = np.where(dropout_mask[:, :, None], fill_bgr, cleaned)
+
     cleaned_u8 = np.clip(np.rint(cleaned), 0, 255).astype(np.uint8)
-    return cleaned_u8, int(np.count_nonzero(dropout_mask))
+    return cleaned_u8, masked_count
 
 
 def temporal_smooth_4k_frame(

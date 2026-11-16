@@ -16,15 +16,15 @@ class PipelineConfig:
     output_dir: Path
     source_mode: Literal["vob", "mp4", "auto"] = "auto"
     deinterlace: Literal["bwdif", "yadif", "none"] = "bwdif"
-    denoise_strength: float = 0.20
-    model_name: str = "RealESRGAN_x4plus"
+    denoise_strength: float = 0.65
+    model_name: str = "realesr-general-x4v3"
     face_enhance: bool = True
-    face_weight: float = 0.90
+    face_weight: float = 0.85
     tile_size: int = 512
     fp16: bool = True
     chunk_seconds: int = 60
     target_4k_mode: Literal["fullscreen_uhd", "pillarbox_uhd", "native_4x"] = "fullscreen_uhd"
-    crf: int = 14
+    crf: int = 17
     preset: str = "medium"
     num_gpus: int = 2
     test_clip_seconds: int | None = None

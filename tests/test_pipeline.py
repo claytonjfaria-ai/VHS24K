@@ -65,15 +65,15 @@ class TestPipelineConfig:
         assert isinstance(cfg.realesrgan_dir, Path)
         assert cfg.source_mode == "auto"
         assert cfg.deinterlace == "bwdif"
-        assert cfg.denoise_strength == 0.20
-        assert cfg.model_name == "RealESRGAN_x4plus"
+        assert cfg.denoise_strength == 0.65
+        assert cfg.model_name == "realesr-general-x4v3"
         assert cfg.face_enhance is True
-        assert cfg.face_weight == 0.90
+        assert cfg.face_weight == 0.85
         assert cfg.tile_size == 512
         assert cfg.fp16 is True
         assert cfg.chunk_seconds == 60
         assert cfg.target_4k_mode == "fullscreen_uhd"
-        assert cfg.crf == 14
+        assert cfg.crf == 17
         assert cfg.preset == "medium"
         assert cfg.num_gpus == 2
         assert cfg.test_clip_seconds is None
@@ -173,14 +173,14 @@ class TestFilters:
             work_dir=tmp_path,
             output_dir=tmp_path,
             deinterlace="bwdif",
-            denoise_strength=0.20,
+            denoise_strength=0.65,
         )
         assert (
             build_deinterlace_denoise_filter(cfg_bwdif)
             == "bwdif=mode=0:parity=auto:deint=all,"
-            "atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08,"
+            "atadenoise=0a=0.06:0b=0.12:1a=0.06:1b=0.12:2a=0.06:2b=0.12,"
             "deflicker=size=5:mode=am,"
-            "hqdn3d=0.36:0.7:0.9:0.9"
+            "hqdn3d=2.27:2.93:3.9:3.9"
         )
 
         cfg_yadif = PipelineConfig(
@@ -204,7 +204,7 @@ class TestFilters:
     def test_4k_scale_filter_modes(self) -> None:
         assert (
             build_4k_scale_filter("fullscreen_uhd", 4, 3)
-            == "scale=3840:2160:flags=lanczos,unsharp=5:5:0.85:3:3:0.0,setsar=1"
+            == "scale=3840:2160:flags=lanczos,setsar=1"
         )
         assert build_4k_scale_filter("pillarbox_uhd", 4, 3) == (
             "scale=2880:2160:flags=lanczos,"
@@ -281,8 +281,9 @@ class TestRealESRGANCommand:
             chunk_in, chunk_out_file, cfg_default, esrgan_dir, report_dir=report_dir
         )
         assert "vhs24k.enhancer_worker" in cmd_default
-        assert cmd_default[cmd_default.index("-n") + 1] == "RealESRGAN_x4plus"
-        assert cmd_default[cmd_default.index("--face-weight") + 1] == "0.9"
+        assert cmd_default[cmd_default.index("-n") + 1] == "realesr-general-x4v3"
+        assert cmd_default[cmd_default.index("--dn") + 1] == "0.65"
+        assert cmd_default[cmd_default.index("--face-weight") + 1] == "0.85"
         assert cmd_default[cmd_default.index("--target-quality-score") + 1] == "82.0"
         assert "--face-enhance" in cmd_default
         assert "--fp32" not in cmd_default
@@ -444,7 +445,9 @@ class TestCLI:
         parser = cli.build_parser()
         default_args = parser.parse_args(["run"])
         default_cfg = cli._config_from_args(default_args)
-        assert default_cfg.face_weight == 0.9
+        assert default_cfg.model_name == "realesr-general-x4v3"
+        assert default_cfg.denoise_strength == 0.65
+        assert default_cfg.face_weight == 0.85
         assert default_cfg.target_4k_mode == "fullscreen_uhd"
         assert default_cfg.test_start_seconds == 1200
         assert default_cfg.source_name is None
@@ -464,6 +467,8 @@ class TestCLI:
                 "VTS_02",
                 "--model",
                 "RealESRGAN_x4plus",
+                "--denoise-strength",
+                "0.45",
                 "--no-face-enhance",
                 "--face-weight",
                 "0.65",
@@ -488,6 +493,7 @@ class TestCLI:
         assert cfg.source_mode == "vob"
         assert cfg.source_name == "VTS_02"
         assert cfg.model_name == "RealESRGAN_x4plus"
+        assert cfg.denoise_strength == 0.45
         assert cfg.face_enhance is False
         assert cfg.face_weight == 0.65
         assert cfg.quality_review is False
@@ -592,13 +598,13 @@ class TestQualityReview:
             ],
         )
         recipe = derive_enhancement_recipe(weak_metrics, base_face_weight=0.75)
-        assert recipe.wb_strength == 0.85
-        assert recipe.clahe_clip_limit == 2.4
-        assert recipe.vibrance_boost == 0.40
+        assert recipe.wb_strength == 0.45
+        assert recipe.clahe_clip_limit == 1.4
+        assert recipe.vibrance_boost == 0.24
         assert recipe.chroma_denoise == 0.75
-        assert recipe.micro_contrast == 0.85
-        assert recipe.pre_sharpen == 0.55
-        assert recipe.face_weight == 0.92
+        assert recipe.micro_contrast == 0.65
+        assert recipe.pre_sharpen == 0.0
+        assert recipe.face_weight == 0.88
 
         clean_metrics = FrameQualityMetrics(
             sharpness=90.0,
@@ -611,8 +617,8 @@ class TestQualityReview:
             deficiencies=[],
         )
         clean_recipe = derive_enhancement_recipe(clean_metrics, base_face_weight=0.75)
-        assert clean_recipe.wb_strength == 0.55
-        assert clean_recipe.clahe_clip_limit == 1.6
+        assert clean_recipe.wb_strength == 0.30
+        assert clean_recipe.clahe_clip_limit == 1.15
         assert clean_recipe.face_weight == 0.75
 
     def test_pre_upscale_color_and_lighting_and_post_polish(self) -> None:
@@ -625,11 +631,38 @@ class TestQualityReview:
         assert pre_fixed.dtype == np.uint8
 
         pre_metrics = analyze_frame(pre_fixed)
-        assert pre_metrics.color_naturalness >= metrics.color_naturalness
+        assert pre_metrics.dynamic_range >= metrics.dynamic_range
+        # White balance reduces the red-blue VHS color cast spread
+        orig_cast = abs(float(np.mean(vhs_frame[:, :, 2])) - float(np.mean(vhs_frame[:, :, 0])))
+        fixed_cast = abs(float(np.mean(pre_fixed[:, :, 2])) - float(np.mean(pre_fixed[:, :, 0])))
+        assert fixed_cast < orig_cast
 
         polished = apply_post_upscale_4k_camera_polish(pre_fixed, recipe)
         assert polished.shape == pre_fixed.shape
         assert polished.dtype == np.uint8
+
+    def test_post_upscale_polish_edge_gate_preserves_flat_surfaces(self) -> None:
+        # Left half: flat sky/water with tiny ±2 micro-noise (grad < 3.5 -> edge_gate == 0)
+        # Right half: sharp structural step edge (grad > 15.5 -> edge_gate == 1)
+        h, w = 80, 160
+        rng = np.random.default_rng(7)
+        frame = np.full((h, w, 3), 120, dtype=np.uint8)
+        flat_noise = rng.integers(-2, 3, size=(h, 70, 1))
+        frame[:, :70, :] = np.clip(120 + flat_noise, 0, 255).astype(np.uint8)
+        frame[:, 110:, :] = 200  # strong vertical structural edge at x=110
+
+        recipe = EnhancementRecipe(micro_contrast=0.65, second_pass_sharpen=0.0)
+        polished = apply_post_upscale_4k_camera_polish(frame, recipe)
+
+        # Flat region should be smoothed (std <= original std), not noise-amplified
+        flat_before_std = float(np.std(frame[:, 10:60, 0].astype(np.float32)))
+        flat_after_std = float(np.std(polished[:, 10:60, 0].astype(np.float32)))
+        assert flat_after_std <= flat_before_std + 0.25
+
+        # Structural edge at x=110 should gain local contrast (overshoot/undershoot acutance)
+        edge_before_span = int(frame[40, 112, 0]) - int(frame[40, 108, 0])
+        edge_after_span = int(polished[40, 112, 0]) - int(polished[40, 108, 0])
+        assert edge_after_span >= edge_before_span
 
     def test_closed_loop_review_and_refine(self) -> None:
         before = _make_synthetic_vhs_frame()

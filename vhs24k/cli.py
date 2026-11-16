@@ -52,8 +52,16 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--model",
-        default="RealESRGAN_x4plus",
-        help="Real-ESRGAN model name (default: RealESRGAN_x4plus).",
+        default="realesr-general-x4v3",
+        help="Real-ESRGAN model name (default: realesr-general-x4v3).",
+    )
+    parser.add_argument(
+        "--denoise-strength",
+        "--dn",
+        dest="denoise_strength",
+        type=float,
+        default=0.65,
+        help="Denoise strength in [0.0, 1.0] (default: 0.65).",
     )
     parser.add_argument(
         "--no-face-enhance",
@@ -63,8 +71,8 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--face-weight",
         type=float,
-        default=0.90,
-        help="GFPGAN face restoration blending weight in [0.0, 1.0] (default: 0.90).",
+        default=0.85,
+        help="GFPGAN face restoration blending weight in [0.0, 1.0] (default: 0.85).",
     )
     parser.add_argument(
         "--no-quality-review",
@@ -175,6 +183,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         work_dir=args.work_dir,
         output_dir=args.output_dir,
         source_mode=args.source_mode,
+        denoise_strength=args.denoise_strength,
         model_name=args.model,
         face_enhance=not args.no_face_enhance,
         face_weight=args.face_weight,

@@ -1,6 +1,6 @@
 # VHS24K
 
-VHS/DVD to 4K restoration and upscaling pipeline built with Python 3.10+, FFmpeg, Real-ESRGAN (23-block `RealESRGAN_x4plus` + `GFPGANv1.4` face enhancement), and an Automated AI Quality Reviewer (`vhs24k/quality_review.py`), designed for dual-GPU Kaggle Notebooks (`2x NVIDIA T4`).
+VHS/DVD to 4K restoration and upscaling pipeline built with Python 3.10+, FFmpeg, Real-ESRGAN (`realesr-general-x4v3` WDN + `GFPGANv1.4` face enhancement), and an Automated AI Quality Reviewer (`vhs24k/quality_review.py`), designed for dual-GPU Kaggle Notebooks (`2x NVIDIA T4`).
 
 ## Architecture
 
@@ -8,13 +8,13 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
 
 1. **Source Discovery & Preprocessing (`vhs24k/preprocess.py`)**
    - `discover_sources()` groups DVD `.VOB` titles (`VTS_01_1.VOB`, `VTS_02_1..3.VOB`) while skipping menus (`VIDEO_TS.VOB`, `*_0.VOB`) and `<1 MB` stubs, or discovers `.mp4` files.
-   - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + temporal stabilization (`atadenoise` + `deflicker`) + gentle `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
+   - `prepare_chunks()` probes stream metadata (`ffprobe`), applies `bwdif` deinterlacing + temporal stabilization (`atadenoise` + `deflicker`) + `hqdn3d` denoising, splits video into `chunk_seconds` (default `60s`) segments (`libx264` CRF 10), extracts the original audio stream (`audio.mka`) without re-encoding, and writes `work/<source_name>/manifest.json`.
 2. **Dual-GPU Upscaling & AI Quality Review (`vhs24k/upscale.py`, `vhs24k/enhancer_worker.py`, `vhs24k/quality_review.py`)**
    - `detect_gpus()` enumerates available CUDA devices via `nvidia-smi -L` (or PyTorch).
-   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with 23-block `RealESRGAN_x4plus`, `--tile 512`, `--face-weight 0.90` (`GFPGANv1.4`), and closed-loop AI quality review.
+   - `upscale_manifest()` dispatches pending chunks in parallel across `num_gpus` workers (binding each worker via `CUDA_VISIBLE_DEVICES`), invoking `vhs24k.enhancer_worker` with `realesr-general-x4v3` WDN (`--denoise-strength 0.65`), `--tile 512`, `--face-weight 0.85` (`GFPGANv1.4`), and closed-loop AI quality review.
    - Updates `manifest.json` atomically (`tempfile` + `os.fsync` + `os.replace`) after every completed chunk.
 3. **4K Assembly & Audio Muxing (`vhs24k/postprocess.py`)**
-   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (default `--4k-mode fullscreen_uhd`: borderless 3840x2160 full-screen scaling with 4K luma acutance; or `pillarbox_uhd` / `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (CRF `14`, with `libx264` fallback).
+   - `assemble_final()` concatenates upscaled chunks, applies `build_4k_scale_filter()` (default `--4k-mode fullscreen_uhd`: borderless 3840x2160 full-screen `lanczos` scaling with `setsar=1`; or `pillarbox_uhd` / `native_4x`), muxes the original audio (`aac` 192k), and encodes to `libx265` (CRF `17`, with `libx264` fallback).
 4. **Google Drive I/O & CLI (`vhs24k/drive_io.py`, `vhs24k/cli.py`, `vhs24k/config.py`)**
    - `PipelineConfig` validates all pipeline parameters.
    - `cli.py` exposes `inspect`, `download`, `prepare`, `upscale`, `assemble`, and `run` subcommands.
@@ -29,12 +29,12 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - **Dynamic Range** (luma p98–p2 spread, histogram entropy, and clipping penalty)
    - **Color Naturalness** (colorfulness + midtone gray-world neutrality)
    - **VHS Artifact-Free** (absence of interlace combing and YCrCb chroma noise)
-2. **Pre-Upscale VHS Overscan Trimming & Color/Lighting Fix**: `compute_safe_overscan_crop()` and `apply_overscan_crop()` conservatively trim black VHS overscan edges and bottom head-switching noise (`<= 4.5%` left/right, `<= 3.5%` top, `<= 5.5%` bottom, with even dimensions) before upscaling. `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
-3. **23-Block `RealESRGAN_x4plus` + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using the 23-RRDB-block `RealESRGAN_x4plus` generator and blends restored faces with `GFPGANv1.4` (`--face-weight 0.90` by default).
-4. **Post-Upscale 4K Camera Polish, Motion-Gated Temporal Smoothing & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` adds luminance-only multi-scale micro-contrast with halo suppression, and `temporal_smooth_4k_frame()` applies motion-gated temporal anti-shimmer smoothing (`exp(-(diff/11)^2)`) so stationary micro-shimmer is stabilized while fast-moving edges stay sharp without ghosting. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
-5. **3-Stage VHS White-Line Dropout Eliminator & Temporal Stabilization**:
-   - **Stage 1 (FFmpeg Preprocess):** `atadenoise=0a=0.04:0b=0.08:1a=0.04:1b=0.08:2a=0.04:2b=0.08` + `deflicker=size=5:mode=am` stabilize tape grain and luminance flicker before upscaling.
-   - **Stage 2 (Pre-Upscale Frame Inpainting):** `remove_vhs_white_line_dropouts()` detects horizontal white/bright VHS tape dropout streaks against adjacent frames (`prev_bgr`/`next_bgr`) and inpaints them cleanly before Real-ESRGAN runs.
+2. **Pre-Upscale VHS Overscan Trimming, Bilateral Surface Smoothing & Color Fix**: `compute_safe_overscan_crop()` and `apply_overscan_crop()` conservatively trim black VHS overscan edges and bottom head-switching noise (`<= 4.5%` left/right, `<= 3.5%` top, `<= 5.5%` bottom, with even dimensions) before upscaling. `derive_enhancement_recipe()` and `apply_pre_upscale_color_and_lighting()` apply **Bilateral Surface Smoothing** (via `cv2.bilateralFilter` to clean VHS grain on flat surfaces while keeping edges sharp), remove YCrCb chroma bleed/noise, neutralize VHS color cast via highlight-protected Gray-World Auto White Balance, expand compressed dynamic range (adaptive LAB CLAHE), and apply skin-safe vibrance.
+3. **`realesr-general-x4v3` WDN + `GFPGANv1.4` Restoration**: `enhancer_worker.py` upscales each frame 4× using `realesr-general-x4v3` with tunable WDN denoising (`--denoise-strength 0.65` by default) and blends restored faces with `GFPGANv1.4` (`--face-weight 0.85` by default).
+4. **Structure-Gated 4K Edge Acutance (`edge_gate`), Motion-Gated Temporal Smoothing & Closed-Loop Refinement**: `apply_post_upscale_4k_camera_polish()` computes a structural gradient `edge_gate` (`grad` on smoothed luma) so flat sky/water surfaces (`edge_gate < 0.15`) are gently smoothed without amplifying noise while structural edges receive multi-scale 4K micro-contrast with halo suppression. `temporal_smooth_4k_frame()` applies motion-gated temporal anti-shimmer smoothing (`exp(-(diff/11)^2)`) so stationary micro-shimmer is stabilized while fast-moving edges stay sharp without ghosting. `closed_loop_review_and_refine()` re-scores the result against `--target-quality-score` (default `82.0`) and automatically triggers a second-pass refinement if below target.
+5. **3-Stage VHS White-Line Dropout Eliminator & 3-Frame Temporal Median Dropout Inpainter**:
+   - **Stage 1 (FFmpeg Preprocess):** `atadenoise=0a=0.06:0b=0.12:1a=0.06:1b=0.12:2a=0.06:2b=0.12` + `deflicker=size=5:mode=am` + `hqdn3d` stabilize tape grain and luminance flicker before upscaling.
+   - **Stage 2 (3-Frame Temporal Median Dropout Inpainter):** `remove_vhs_white_line_dropouts()` detects horizontal white/bright VHS tape dropout streaks against adjacent frames (`prev_bgr`/`next_bgr`) and inpaints them cleanly before Real-ESRGAN runs.
    - **Stage 3 (Post-Upscale 4K Temporal Smoother):** `temporal_smooth_4k_frame()` suppresses frame-to-frame 4K hallucination shimmer on static regions while preserving motion.
 6. **Diagnostics & Visual Proof**: For each chunk, `save_comparison_and_report()` writes `<chunk>_quality_report.json` (before/after scores, grade, fixed deficiencies, and recipe) and `<chunk>_before_vs_after_4k.jpg` (side-by-side comparison). Use `--no-quality-review` to bypass this stage if needed.
 
@@ -45,7 +45,7 @@ VHS24K processes interlaced VHS/DVD rips (`.VOB` title sets or `.mp4` files) in 
    - Set **Accelerator** to **GPU T4 x2**.
    - Enable **Internet** (required to clone `xinntao/Real-ESRGAN`, install dependencies, and transfer files from Google Drive).
 3. Verify both GPUs are visible (`!nvidia-smi` should list GPU 0 and GPU 1).
-4. The pipeline defaults to `--num-gpus 2`, `--tile 512`, FP16 inference, and `RealESRGAN_x4plus` so each T4 processes independent 60-second chunks concurrently.
+4. The pipeline defaults to `--num-gpus 2`, `--tile 512`, FP16 inference, and `realesr-general-x4v3` (`--denoise-strength 0.65`) so each T4 processes independent 60-second chunks concurrently.
 
 ## Google Drive `Wedding` Folder Integration
 
