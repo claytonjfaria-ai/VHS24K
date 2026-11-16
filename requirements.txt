@@ -1,0 +1,3 @@
+# Core vhs24k package uses Python 3.10+ stdlib + system ffmpeg/ffprobe.
+# Heavy GPU dependencies (torch, realesrgan, gfpgan) are installed in the Kaggle notebook environment.
+pytest>=7.0
