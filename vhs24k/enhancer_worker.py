@@ -151,12 +151,20 @@ def _sample_chunk_metrics(
 
 def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
     """Initialize ``RealESRGANer`` and optional ``GFPGANer`` on GPU/CPU."""
+    realesrgan_dir = Path(args.realesrgan_dir)
+    local_pkg_dir = realesrgan_dir / "realesrgan"
+    local_version_py = local_pkg_dir / "version.py"
+    if local_pkg_dir.is_dir() and not local_version_py.exists():
+        local_version_py.write_text(
+            "__version__ = '0.3.0'\n__gitsha__ = 'unknown'\nversion_info = (0, 3, 0)\n",
+            encoding="utf-8",
+        )
+
     import torch  # type: ignore[import-not-found]
     from basicsr.archs.rrdbnet_arch import RRDBNet  # type: ignore[import-not-found]
     from realesrgan import RealESRGANer  # type: ignore[import-not-found]
     from realesrgan.archs.srvgg_arch import SRVGGNetCompact  # type: ignore[import-not-found]
 
-    realesrgan_dir = Path(args.realesrgan_dir)
     use_half = (not args.fp32) and torch.cuda.is_available()
 
     if args.model_name == "RealESRGAN_x4plus":

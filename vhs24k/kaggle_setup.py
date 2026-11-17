@@ -91,6 +91,13 @@ def setup_kaggle_environment(realesrgan_dir: str | pathlib.Path = "/kaggle/worki
             check=True,
         )
 
+    realesrgan_ver = realesrgan_path / "realesrgan" / "version.py"
+    if realesrgan_ver.parent.is_dir() and not realesrgan_ver.exists():
+        realesrgan_ver.write_text(
+            "__version__ = '0.3.0'\n__gitsha__ = 'unknown'\nversion_info = (0, 3, 0)\n",
+            encoding="utf-8",
+        )
+
     print("4/4 Downloading Real-ESRGAN & GFPGAN weights...")
     for rel_dest, url in WEIGHT_URLS.items():
         dest = realesrgan_path / rel_dest
