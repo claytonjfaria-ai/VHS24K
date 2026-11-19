@@ -77,7 +77,7 @@ class TestPipelineConfig:
         assert cfg.preset == "medium"
         assert cfg.num_gpus == 2
         assert cfg.test_clip_seconds is None
-        assert cfg.test_start_seconds == 1200
+        assert cfg.test_start_seconds == 900
         assert cfg.source_name is None
         assert cfg.dry_run is False
         assert cfg.quality_review is True
@@ -449,7 +449,7 @@ class TestCLI:
         assert default_cfg.denoise_strength == 0.65
         assert default_cfg.face_weight == 0.85
         assert default_cfg.target_4k_mode == "fullscreen_uhd"
-        assert default_cfg.test_start_seconds == 1200
+        assert default_cfg.test_start_seconds == 900
         assert default_cfg.source_name is None
 
         args = parser.parse_args(

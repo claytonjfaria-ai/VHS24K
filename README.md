@@ -74,9 +74,9 @@ Disk: Kaggle's `/kaggle/working` is limited to about 20 GB. Preprocessed chunks,
   python -m vhs24k.cli download --input-dir /kaggle/working/input --source-mode vob --method gdown
   ```
 
-## `--test-clip 15` Workflow
+## `--test-clip 60` Workflow
 
-Before committing a full multi-hour upscale run, verify deinterlacing, 4:3 pillarboxing, denoise strength, and GFPGAN face enhancement on a 15-second clip:
+Before committing a full multi-hour upscale run, verify deinterlacing, 4:3 pillarboxing, denoise strength, and GFPGAN face enhancement on a 60-second clip taken from the ceremony (15 minutes in, which skips the opening scene):
 
 ```bash
 python -m vhs24k.cli run \
@@ -84,10 +84,11 @@ python -m vhs24k.cli run \
   --work-dir /kaggle/working/work \
   --output-dir /kaggle/working/output \
   --realesrgan-dir /kaggle/working/Real-ESRGAN \
-  --test-clip 15
+  --test-clip 60 \
+  --test-start 900
 ```
 
-This trims preprocessing to the first 15 seconds (`-t 15`) and outputs `<source_name>_test_4k.mp4`. Once satisfied with the visual quality, remove `--test-clip 15` (and clear the test `work/` directory) to run the full tapes.
+This takes 60 seconds starting 900 s (15 minutes) into the source (`-ss 900 -t 60`) and outputs `<source_name>_test_4k.mp4`. Use `--source-name VTS_01` or `VTS_02` to pick the title; with no name, the test uses VTS_02. Once satisfied with the visual quality, remove `--test-clip 60 --test-start 900` (and clear the test `work/` directory) to run the full tapes.
 
 ## 12-Hour Session Resume Behavior
 

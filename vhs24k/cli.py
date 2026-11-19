@@ -100,8 +100,8 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--test-start",
         type=int,
-        default=1200,
-        help="Start offset in seconds when using --test-clip (default: 1200s to sample near the middle of the video).",
+        default=900,
+        help="Start offset in seconds when using --test-clip (default: 900s = 15 minutes in, to skip the opening scene and sample the ceremony).",
     )
     parser.add_argument(
         "--num-gpus",
