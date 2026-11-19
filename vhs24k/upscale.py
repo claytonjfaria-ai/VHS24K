@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from vhs24k.config import PipelineConfig
+from vhs24k.encoding import resolve_encoder
+from vhs24k.postprocess import _parse_dar, build_4k_scale_filter
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +95,15 @@ def build_enhancer_worker_cmd(
     cfg: PipelineConfig,
     realesrgan_dir: Path,
     report_dir: Path | None = None,
+    *,
+    codec: str | None = None,
+    scale_filter: str | None = None,
 ) -> list[str]:
-    """Build the ``vhs24k.enhancer_worker`` command for a video chunk."""
+    """Build the ``vhs24k.enhancer_worker`` command for a video chunk.
+
+    When ``codec`` is given the worker encodes the chunk straight to its final
+    4K format (scaled with ``scale_filter``), so assembly can stream-copy it.
+    """
     cmd: list[str] = [
         sys.executable,
         "-m",
@@ -122,9 +131,38 @@ def build_enhancer_worker_cmd(
         cmd.append("--fp32")
     if not getattr(cfg, "quality_review", True):
         cmd.append("--no-quality-review")
+    if not getattr(cfg, "gpu_post", True):
+        cmd.append("--no-gpu-post")
     if report_dir is not None:
         cmd.extend(["--report-dir", str(report_dir)])
+    if codec:
+        cmd.extend(["--codec", codec, "--crf", str(cfg.crf), "--preset", cfg.chunk_preset])
+        if scale_filter:
+            cmd.extend(["--scale-filter", scale_filter])
     return cmd
+
+
+def _plan_final_encode(manifest_data: Any, cfg: PipelineConfig) -> dict[str, str] | None:
+    """Decide the codec and 4K scale filter chunks are encoded with, pinned in the manifest.
+
+    A resumed session reuses the pinned codec so every chunk of one source has
+    compatible streams (required for the stream-copy assembly). Returns ``None``
+    when chunks are not produced by the enhancer worker.
+    """
+    if not getattr(cfg, "quality_review", True):
+        return None
+    pinned = manifest_data.get("final_encode") if isinstance(manifest_data, dict) else None
+    if isinstance(pinned, dict) and pinned.get("codec") and pinned.get("scale_filter"):
+        return {"codec": str(pinned["codec"]), "scale_filter": str(pinned["scale_filter"])}
+
+    video_info = (manifest_data.get("video_info") if isinstance(manifest_data, dict) else None) or {}
+    dar_w, dar_h = _parse_dar(video_info.get("dar"))
+    scale_filter = build_4k_scale_filter(cfg.target_4k_mode, dar_w, dar_h)
+    if cfg.dry_run:
+        codec = cfg.video_codec if cfg.video_codec != "auto" else "libx265"
+    else:
+        codec = resolve_encoder(cfg.video_codec, cfg.crf, cfg.chunk_preset).codec
+    return {"codec": codec, "scale_filter": scale_filter}
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
@@ -224,6 +262,12 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
 
     repo_root = str(Path(__file__).resolve().parent.parent)
 
+    final_encode = _plan_final_encode(manifest_data, cfg)
+    if final_encode is not None and isinstance(manifest_data, dict) and not cfg.dry_run:
+        if manifest_data.get("final_encode") != final_encode:
+            manifest_data["final_encode"] = final_encode
+            _atomic_write_json(manifest_path, manifest_data)
+
     detected_gpus = detect_gpus()
     num_workers = max(1, min(cfg.num_gpus, max(1, len(detected_gpus))))
     gpu_queue: queue.Queue[int | None] = queue.Queue()
@@ -249,6 +293,8 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
                 cfg,
                 realesrgan_dir,
                 report_dir=chunk_output,
+                codec=final_encode["codec"] if final_encode else None,
+                scale_filter=final_encode["scale_filter"] if final_encode else None,
             )
         else:
             cmd = build_realesrgan_cmd(chunk_input, chunk_output, cfg, realesrgan_dir)
@@ -302,6 +348,11 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
             with lock:
                 chunk["status"] = "done"
                 chunk.pop("error", None)
+                # Tag how this chunk was encoded; assembly stream-copies only when every chunk matches.
+                if final_encode is not None:
+                    chunk["final_encode"] = dict(final_encode)
+                else:
+                    chunk.pop("final_encode", None)
                 if produced.exists():
                     chunk["upscaled_path"] = str(produced)
                     chunk["output_path"] = str(produced)

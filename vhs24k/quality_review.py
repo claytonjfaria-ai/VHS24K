@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -661,8 +661,18 @@ def closed_loop_review_and_refine(
     after_bgr: np.ndarray,
     recipe: EnhancementRecipe,
     target_score: float = 82.0,
+    polish_fn: Callable[[np.ndarray, EnhancementRecipe], np.ndarray] | None = None,
+    raw_upscaled_bgr: np.ndarray | None = None,
 ) -> tuple[np.ndarray, FrameQualityMetrics, FrameQualityMetrics, EnhancementRecipe, bool]:
-    """Evaluate before/after frames and iteratively refine until target quality is reached."""
+    """Evaluate before/after frames and iteratively refine until target quality is reached.
+
+    ``polish_fn`` lets callers substitute a faster (e.g. GPU) polish implementation.
+    When ``raw_upscaled_bgr`` (the upscaled frame *before* any polish) is given, every
+    candidate recipe is applied to it directly, so the score reflects exactly what the
+    final single-pass polish will produce rather than a polish stacked on a polish.
+    The returned recipe is always the best one found, never merely the last one tried.
+    """
+    polish = polish_fn or apply_post_upscale_4k_camera_polish
     before_metrics = analyze_frame(before_bgr)
     after_metrics = analyze_frame(after_bgr)
 
@@ -676,6 +686,7 @@ def closed_loop_review_and_refine(
 
     best_bgr = after_bgr
     best_metrics = after_metrics
+    best_recipe = recipe
     current_recipe = recipe
 
     for iteration in range(2):
@@ -702,11 +713,13 @@ def closed_loop_review_and_refine(
             second_pass_sharpen=round(extra_sharpen, 3),
         )
 
-        candidate_bgr = apply_post_upscale_4k_camera_polish(best_bgr, current_recipe)
+        source_bgr = raw_upscaled_bgr if raw_upscaled_bgr is not None else best_bgr
+        candidate_bgr = polish(source_bgr, current_recipe)
         candidate_metrics = analyze_frame(candidate_bgr)
         if candidate_metrics.overall_score >= best_metrics.overall_score:
             best_bgr = candidate_bgr
             best_metrics = candidate_metrics
+            best_recipe = current_recipe
 
         if (
             best_metrics.overall_score >= target_score
@@ -716,7 +729,7 @@ def closed_loop_review_and_refine(
         ):
             break
 
-    return best_bgr, before_metrics, best_metrics, current_recipe, True
+    return best_bgr, before_metrics, best_metrics, best_recipe, True
 
 
 def _resize_to_height(bgr: np.ndarray, target_h: int) -> np.ndarray:

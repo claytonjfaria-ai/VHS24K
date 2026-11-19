@@ -673,10 +673,38 @@ class TestQualityReview:
             before, before, recipe, target_score=95.0
         )
         assert refined is True
-        assert updated_recipe.second_pass_sharpen > 0.0
         assert out_frame.shape == before.shape
         assert isinstance(before_m, FrameQualityMetrics)
         assert isinstance(after_m, FrameQualityMetrics)
+        # The returned recipe is never one that scored worse than the original
+        assert after_m.overall_score >= analyze_frame(before).overall_score
+
+        # A candidate that scores better is accepted and its recipe is returned
+        better = _make_textured_frame(height=before.shape[0], width=before.shape[1])
+        _, _, better_m, accepted_recipe, refined_better = closed_loop_review_and_refine(
+            before,
+            before,
+            recipe,
+            target_score=99.0,
+            polish_fn=lambda _frame, _recipe: better,
+        )
+        assert refined_better is True
+        assert accepted_recipe.second_pass_sharpen > 0.0
+        assert better_m.overall_score >= analyze_frame(before).overall_score
+
+        # A candidate that scores worse is rejected and the original recipe is kept
+        worse = np.full_like(before, 128)
+        kept_frame, _, kept_m, kept_recipe, _ = closed_loop_review_and_refine(
+            before,
+            before,
+            recipe,
+            target_score=99.0,
+            polish_fn=lambda _frame, _recipe: worse,
+        )
+        assert kept_recipe == recipe
+        assert kept_recipe.second_pass_sharpen == 0.0
+        assert kept_frame is before
+        assert kept_m.overall_score == analyze_frame(before).overall_score
 
         # Sharp after-frame above low target_score skips second-pass refinement
         sharp = _make_textured_frame()

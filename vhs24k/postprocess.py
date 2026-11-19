@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
 from vhs24k.config import PipelineConfig
+from vhs24k.encoding import EncoderSpec, build_encoder_spec, resolve_encoder
+
+logger = logging.getLogger(__name__)
 
 UHD_WIDTH = 3840
 UHD_HEIGHT = 2160
@@ -74,15 +78,52 @@ def _has_encoder(encoder_name: str) -> bool:
     return encoder_name in proc.stdout
 
 
+_HEVC_CODECS = ("libx265", "hevc_nvenc")
+
+
+def _uniform_final_encode(chunks: list[dict]) -> dict | None:
+    """Return the shared ``final_encode`` tag if *every* chunk has the same one, else ``None``.
+
+    Stream-copying needs identical codec, size and parameters across all chunks,
+    so a single untagged or differently-tagged chunk forces the safe re-encode path.
+    """
+    tags = [c.get("final_encode") for c in chunks]
+    if not tags or not all(isinstance(t, dict) and t.get("codec") for t in tags):
+        return None
+    first = tags[0]
+    return first if all(t == first for t in tags) else None
+
+
+def _build_stream_copy_command(
+    concat_file: Path,
+    audio_path: Path | None,
+    output_path: Path,
+    codec: str,
+) -> list[str]:
+    """Join already-final 4K chunks and mux audio without re-encoding the video."""
+    cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats"]
+    cmd.extend(["-f", "concat", "-safe", "0", "-i", str(concat_file)])
+    if audio_path is not None:
+        cmd.extend(["-i", str(audio_path)])
+    cmd.extend(["-map", "0:v:0", "-c:v", "copy"])
+    if codec in _HEVC_CODECS:
+        cmd.extend(["-tag:v", "hvc1"])
+    if audio_path is not None:
+        cmd.extend(["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+    else:
+        cmd.append("-an")
+    cmd.extend(["-movflags", "+faststart", str(output_path)])
+    return cmd
+
+
 def _build_assemble_command(
     concat_file: Path,
     audio_path: Path | None,
     vf_filter: str,
-    codec: str,
+    encoder: EncoderSpec,
     output_path: Path,
-    cfg: PipelineConfig,
 ) -> list[str]:
-    """Construct the final FFmpeg assembly command."""
+    """Construct the full re-encode assembly command (used when chunks are not already final)."""
     cmd: list[str] = [
         "ffmpeg",
         "-y",
@@ -96,7 +137,7 @@ def _build_assemble_command(
     if audio_path is not None:
         cmd.extend(["-i", str(audio_path)])
 
-    cmd.extend(["-vf", vf_filter, "-c:v", codec, "-crf", str(cfg.crf), "-preset", cfg.preset])
+    cmd.extend(["-vf", vf_filter, *encoder.args, *encoder.container_tag_args])
     cmd.extend([
         "-pix_fmt",
         "yuv420p",
@@ -156,8 +197,32 @@ def assemble_final(manifest_path: Path, output_path: Path, cfg: PipelineConfig) 
     vf_filter = build_4k_scale_filter(cfg.target_4k_mode, dar_w, dar_h)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    primary_codec = "libx264"
-    cmd = _build_assemble_command(concat_file, audio_path, vf_filter, primary_codec, output_path, cfg)
+
+    final_encode = _uniform_final_encode(chunks)
+    if final_encode is None and any(c.get("final_encode") for c in chunks):
+        logger.warning(
+            "Chunks were encoded differently (e.g. resumed from an older session); "
+            "falling back to a full re-encode of the joined video."
+        )
+    if final_encode is not None:
+        copy_cmd = _build_stream_copy_command(
+            concat_file, audio_path, output_path, str(final_encode["codec"])
+        )
+        if cfg.dry_run:
+            return output_path
+        try:
+            subprocess.run(copy_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"FFmpeg stream-copy assembly failed: {exc.stderr.strip()}") from exc
+        return output_path
+
+    # Chunks are not final 4K: scale and encode the whole video here (slow, CPU-bound).
+    if cfg.dry_run:
+        preferred = cfg.video_codec if cfg.video_codec != "auto" else "libx265"
+        primary = build_encoder_spec(preferred, cfg.crf, cfg.preset)
+    else:
+        primary = resolve_encoder(cfg.video_codec, cfg.crf, cfg.preset)
+    cmd = _build_assemble_command(concat_file, audio_path, vf_filter, primary, output_path)
 
     if cfg.dry_run:
         return output_path
@@ -165,17 +230,15 @@ def assemble_final(manifest_path: Path, output_path: Path, cfg: PipelineConfig) 
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as exc:
-        if primary_codec == "libx265":
-            fallback_cmd = _build_assemble_command(
-                concat_file, audio_path, vf_filter, "libx264", output_path, cfg
-            )
-            try:
-                subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
-            except subprocess.CalledProcessError as fallback_exc:
-                raise RuntimeError(
-                    f"FFmpeg assembly failed with libx265 and libx264: {fallback_exc.stderr.strip()}"
-                ) from fallback_exc
-        else:
+        if primary.codec == "libx264":
             raise RuntimeError(f"FFmpeg assembly failed: {exc.stderr.strip()}") from exc
+        fallback = build_encoder_spec("libx264", cfg.crf, cfg.preset)
+        fallback_cmd = _build_assemble_command(concat_file, audio_path, vf_filter, fallback, output_path)
+        try:
+            subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as fallback_exc:
+            raise RuntimeError(
+                f"FFmpeg assembly failed with {primary.codec} and libx264: {fallback_exc.stderr.strip()}"
+            ) from fallback_exc
 
     return output_path

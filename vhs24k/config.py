@@ -34,6 +34,9 @@ class PipelineConfig:
     dry_run: bool = False
     quality_review: bool = True
     target_quality_score: float = 82.0
+    video_codec: Literal["auto", "hevc_nvenc", "libx265", "libx264"] = "auto"
+    chunk_preset: str = "auto"
+    gpu_post: bool = True
 
     def __post_init__(self) -> None:
         self.input_dir = Path(self.input_dir)
@@ -48,6 +51,8 @@ class PipelineConfig:
             raise ValueError(f"Unsupported deinterlace: {self.deinterlace!r}")
         if self.target_4k_mode not in ("fullscreen_uhd", "pillarbox_uhd", "native_4x"):
             raise ValueError(f"Unsupported target_4k_mode: {self.target_4k_mode!r}")
+        if self.video_codec not in ("auto", "hevc_nvenc", "libx265", "libx264"):
+            raise ValueError(f"Unsupported video_codec: {self.video_codec!r}")
         if not 0.0 <= self.denoise_strength <= 1.0:
             raise ValueError(f"denoise_strength must be in [0.0, 1.0], got {self.denoise_strength}")
         if not 0.0 <= self.face_weight <= 1.0:

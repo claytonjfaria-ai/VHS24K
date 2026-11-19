@@ -117,6 +117,24 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
         help="4K output framing mode (default: fullscreen_uhd).",
     )
     parser.add_argument(
+        "--codec",
+        dest="video_codec",
+        choices=("auto", "hevc_nvenc", "libx265", "libx264"),
+        default="auto",
+        help="Final 4K video encoder (default: auto = GPU HEVC if usable, else libx265).",
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=17,
+        help="Final video quality; lower is better and larger (default: 17).",
+    )
+    parser.add_argument(
+        "--no-gpu-post",
+        action="store_true",
+        help="Run the 4K polish/temporal smoothing on the CPU instead of the GPU.",
+    )
+    parser.add_argument(
         "--realesrgan-dir",
         type=Path,
         default=None,
@@ -177,6 +195,9 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         extra["target_quality_score"] = args.target_quality_score
     if "source_name" in field_names:
         extra["source_name"] = args.source_name
+    extra["video_codec"] = args.video_codec
+    extra["crf"] = args.crf
+    extra["gpu_post"] = not args.no_gpu_post
 
     return PipelineConfig(
         input_dir=args.input_dir,

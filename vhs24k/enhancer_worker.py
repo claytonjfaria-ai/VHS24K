@@ -5,12 +5,24 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
-import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+
+from vhs24k.encoding import (
+    CODEC_CHOICES,
+    build_chunk_writer_cmd,
+    build_encoder_spec,
+    build_legacy_chunk_writer_cmd,
+    encoder_works,
+    resolve_encoder,
+)
+from vhs24k.frame_pipeline import FfmpegSink, run_pipeline
 
 logger = logging.getLogger(__name__)
+
+TEMPORAL_SMOOTH_STRENGTH = 0.48
+CALIBRATION_FRAME_INDEX = 15
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,7 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/kaggle/working/Real-ESRGAN"),
         help="Path to cloned xinntao/Real-ESRGAN repository.",
     )
-    parser.add_argument("--tile", type=int, default=512, help="Tile size (default: 512).")
+    parser.add_argument("--tile", type=int, default=512, help="Tile size for large frames (default: 512).")
+    parser.add_argument(
+        "--no-tile-max",
+        type=int,
+        default=1280,
+        help="Frames whose longest side is at most this are processed without tiling (default: 1280).",
+    )
     parser.add_argument("--dn", type=float, default=0.65, help="Denoise strength for general-v3 (default: 0.65).")
     parser.add_argument("--face-enhance", action="store_true", help="Enable GFPGAN face restoration.")
     parser.add_argument(
@@ -56,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable closed-loop AI Quality Review & 4K camera polish (default: True).",
     )
     parser.add_argument(
+        "--gpu-post",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the 4K polish and temporal smoothing on the GPU (default: True).",
+    )
+    parser.add_argument(
         "--target-quality-score",
         type=float,
         default=82.0,
@@ -66,6 +90,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Optional directory for quality report JSON and before/after 4K comparison JPG.",
+    )
+    parser.add_argument(
+        "--codec",
+        choices=CODEC_CHOICES,
+        default=None,
+        help="Encode the chunk to its final 4K format with this codec. "
+        "Omit for the legacy unscaled intermediate.",
+    )
+    parser.add_argument("--crf", type=int, default=17, help="Encoder quality (CRF/CQ base, default: 17).")
+    parser.add_argument("--preset", default="auto", help="Encoder preset (default: auto per codec).")
+    parser.add_argument(
+        "--scale-filter",
+        default=None,
+        help="FFmpeg scale filter chain applied before encoding (e.g. the 4K scale/pad filter).",
     )
     return parser
 
@@ -149,7 +187,17 @@ def _sample_chunk_metrics(
         cap.release()
 
 
-def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
+def _ensure_weight(url: str, dest: Path) -> None:
+    """Download a model weight file once."""
+    if dest.exists():
+        return
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(url, dest)  # noqa: S310 - fixed https release URLs
+
+
+def _init_upsampler(args: argparse.Namespace, tile: int) -> tuple[Any, Any | None]:
     """Initialize ``RealESRGANer`` and optional ``GFPGANer`` on GPU/CPU."""
     realesrgan_dir = Path(args.realesrgan_dir)
     local_pkg_dir = realesrgan_dir / "realesrgan"
@@ -165,61 +213,30 @@ def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
     from realesrgan import RealESRGANer  # type: ignore[import-not-found]
     from realesrgan.archs.srvgg_arch import SRVGGNetCompact  # type: ignore[import-not-found]
 
+    # Frame and face-crop shapes are constant within a chunk, so autotuning pays off.
+    torch.backends.cudnn.benchmark = True
     use_half = (not args.fp32) and torch.cuda.is_available()
+    release = "https://github.com/xinntao/Real-ESRGAN/releases/download"
 
     if args.model_name == "RealESRGAN_x4plus":
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=23,
-            num_grow_ch=32,
-            scale=4,
-        )
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
         local_weight = realesrgan_dir / "weights" / "RealESRGAN_x4plus.pth"
-        if not local_weight.exists():
-            import urllib.request
-
-            local_weight.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(
-                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-                local_weight,
-            )
+        _ensure_weight(f"{release}/v0.1.0/RealESRGAN_x4plus.pth", local_weight)
         model_path: str | list[str] = str(local_weight)
         dni_weight = None
     elif args.model_name == "realesr-general-x4v3":
         model = SRVGGNetCompact(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_conv=32,
-            upscale=4,
-            act_type="prelu",
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
         )
         weights_dir = realesrgan_dir / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
         main_w = weights_dir / "realesr-general-x4v3.pth"
         wdn_w = weights_dir / "realesr-general-wdn-x4v3.pth"
-        if not main_w.exists():
-            import urllib.request
-
-            urllib.request.urlretrieve(
-                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
-                main_w,
-            )
-        if not wdn_w.exists():
-            import urllib.request
-
-            urllib.request.urlretrieve(
-                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
-                wdn_w,
-            )
+        _ensure_weight(f"{release}/v0.2.5.0/realesr-general-x4v3.pth", main_w)
+        _ensure_weight(f"{release}/v0.2.5.0/realesr-general-wdn-x4v3.pth", wdn_w)
         if args.dn <= 0.0:
-            model_path = str(main_w)
-            dni_weight = None
+            model_path, dni_weight = str(main_w), None
         elif args.dn >= 1.0:
-            model_path = str(wdn_w)
-            dni_weight = None
+            model_path, dni_weight = str(wdn_w), None
         else:
             model_path = [str(main_w), str(wdn_w)]
             dni_weight = [1.0 - args.dn, args.dn]
@@ -231,7 +248,7 @@ def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
         model_path=model_path,
         dni_weight=dni_weight,
         model=model,
-        tile=args.tile,
+        tile=tile,
         tile_pad=10,
         pre_pad=0,
         half=use_half,
@@ -258,46 +275,176 @@ def _init_upsampler(args: argparse.Namespace) -> tuple[Any, Any | None]:
     return upsampler, face_enhancer
 
 
-def _open_ffmpeg_writer(output_file: Path, width: int, height: int, fps: float) -> subprocess.Popen[bytes]:
-    """Open an FFmpeg rawvideo pipe writer encoding at CRF 16."""
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        f"{fps:.6f}",
-        "-i",
-        "pipe:0",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "16",
-        "-preset",
-        "fast",
-        "-pix_fmt",
-        "yuv420p",
-        str(output_file),
-    ]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+def _effective_tile(args: argparse.Namespace, crop_w: int, crop_h: int) -> int:
+    """SD frames fit in GPU memory whole; skipping tiling avoids seams and per-tile overhead."""
+    return 0 if max(crop_w, crop_h) <= args.no_tile_max else args.tile
 
 
-def _unpack_review_result(result: Any, fallback_frame: Any, fallback_recipe: Any) -> tuple[Any, Any, Any]:
-    """Normalize return tuple from ``closed_loop_review_and_refine``."""
-    if not isinstance(result, tuple):
-        return fallback_frame, fallback_recipe, result
-    if len(result) == 3:
-        return result[0], result[1], result[2]
-    if len(result) == 2:
-        first, second = result
-        if hasattr(first, "shape"):
-            return first, fallback_recipe, second
-        return fallback_frame, first, second
-    return fallback_frame, fallback_recipe, result
+def _make_enhance_fn(
+    upsampler: Any, face_enhancer: Any | None, face_weight_fn: Callable[[], float]
+) -> Callable[[Any], Any]:
+    """Return ``pre_frame -> upscaled uint8 BGR`` using GFPGAN or plain Real-ESRGAN."""
+    if face_enhancer is not None:
+
+        def enhance_with_faces(frame: Any) -> Any:
+            _, _, restored = face_enhancer.enhance(
+                frame,
+                has_aligned=False,
+                only_center_face=False,
+                paste_back=True,
+                weight=face_weight_fn(),
+            )
+            return restored
+
+        return enhance_with_faces
+
+    def enhance_plain(frame: Any) -> Any:
+        upscaled, _ = upsampler.enhance(frame, outscale=4)
+        return upscaled
+
+    return enhance_plain
+
+
+def _iter_prepared_frames(
+    input_path: Path,
+    crop_box: tuple[int, int, int, int],
+    recipe: Any | None,
+    stats: dict[str, int],
+) -> Iterator[Any]:
+    """Yield pre-upscale frames (crop, dropout removal, colour fix) in order.
+
+    Runs on a background thread. ``recipe`` is ``None`` when quality review is off,
+    in which case frames are yielded untouched.
+    """
+    import cv2  # type: ignore[import-not-found]
+    from vhs24k.quality_review import (
+        apply_overscan_crop,
+        apply_pre_upscale_color_and_lighting,
+        remove_vhs_white_line_dropouts,
+    )
+
+    cap = cv2.VideoCapture(str(input_path))
+    try:
+
+        def read_cropped() -> Any | None:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+            return apply_overscan_crop(frame, crop_box) if recipe is not None else frame
+
+        prev_raw: Any | None = None
+        curr_raw = read_cropped()
+        next_raw = read_cropped() if curr_raw is not None else None
+        while curr_raw is not None:
+            if recipe is not None:
+                clean, n_dropouts = remove_vhs_white_line_dropouts(curr_raw, prev_raw, next_raw)
+                stats["dropouts"] += n_dropouts
+                yield apply_pre_upscale_color_and_lighting(clean, recipe)
+            else:
+                yield curr_raw
+            prev_raw, curr_raw = curr_raw, next_raw
+            next_raw = read_cropped() if curr_raw is not None else None
+    finally:
+        cap.release()
+
+
+def _calibrate_recipe(
+    args: argparse.Namespace,
+    input_path: Path,
+    crop_box: tuple[int, int, int, int],
+    recipe: Any,
+    total_frames: int,
+    enhance: Callable[[Any], Any],
+    post: Any,
+    report_dir: Path,
+    frame_size: tuple[int, int],
+) -> Any:
+    """Run the closed-loop quality review once on a representative frame, *before* the chunk.
+
+    The refined recipe is then used for every frame of the chunk, so the whole chunk
+    has one consistent look (previously frames before the review used a weaker recipe
+    than frames after it).
+    """
+    import cv2  # type: ignore[import-not-found]
+    from vhs24k.quality_review import (
+        apply_overscan_crop,
+        apply_pre_upscale_color_and_lighting,
+        closed_loop_review_and_refine,
+        remove_vhs_white_line_dropouts,
+        save_comparison_and_report,
+    )
+
+    rep_idx = min(CALIBRATION_FRAME_INDEX, max(0, total_frames // 2)) if total_frames > 0 else 0
+    cap = cv2.VideoCapture(str(input_path))
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, rep_idx - 1))
+        frames: list[Any] = []
+        for _ in range(3 if rep_idx > 0 else 2):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            frames.append(apply_overscan_crop(frame, crop_box))
+    finally:
+        cap.release()
+
+    offset = 1 if rep_idx > 0 else 0
+    if len(frames) <= offset:
+        logger.warning("Could not read calibration frame from %s; using the initial recipe.", input_path)
+        return recipe
+    prev_f = frames[offset - 1] if offset > 0 else None
+    curr_f = frames[offset]
+    next_f = frames[offset + 1] if len(frames) > offset + 1 else None
+
+    clean, _ = remove_vhs_white_line_dropouts(curr_f, prev_f, next_f)
+    upscaled = enhance(apply_pre_upscale_color_and_lighting(clean, recipe))
+    initial = post.polish_to_numpy(upscaled, recipe)
+    refined, before_m, after_m, final_recipe, was_refined = closed_loop_review_and_refine(
+        curr_f,
+        initial,
+        recipe,
+        target_score=args.target_quality_score,
+        polish_fn=post.polish_to_numpy,
+        raw_upscaled_bgr=upscaled,
+    )
+    saved = save_comparison_and_report(
+        curr_f, refined, before_m, after_m, final_recipe, report_dir, input_path.stem
+    )
+    width, height = frame_size
+    crop_h, crop_w = curr_f.shape[:2]
+    print(
+        f"[Quality Review] {input_path.stem}: "
+        f"Trimmed overscan: {width}x{height} -> {crop_w}x{crop_h} | "
+        f"Before={before_m.overall_score:.1f}/100 -> "
+        f"After={after_m.overall_score:.1f}/100 "
+        f"({after_m.grade}) | "
+        f"Auto-Refined={was_refined} | "
+        f"Report={saved.get('report_json')}",
+        flush=True,
+    )
+    return final_recipe
+
+
+def _open_sink(
+    args: argparse.Namespace, output_file: Path, out_w: int, out_h: int, fps: float
+) -> FfmpegSink:
+    """Open the FFmpeg writer: final-quality 4K when ``--codec`` is set, legacy intermediate otherwise."""
+    if args.codec:
+        if args.codec == "auto":
+            encoder = resolve_encoder("auto", args.crf, args.preset)
+        else:
+            # The parent pinned this codec for every chunk of the source. Switching silently
+            # would make the stream-copy join produce a broken file, so fail the chunk instead.
+            encoder = build_encoder_spec(args.codec, args.crf, args.preset)
+            if not encoder_works(encoder.codec, encoder.args):
+                raise RuntimeError(
+                    f"Pinned video encoder {args.codec!r} is not usable on this machine; "
+                    "refusing to switch codecs mid-source. Re-run with --codec libx265, "
+                    "or clear 'final_encode' in the manifest and the finished chunks to restart."
+                )
+        cmd = build_chunk_writer_cmd(output_file, out_w, out_h, fps, encoder, args.scale_filter)
+    else:
+        cmd = build_legacy_chunk_writer_cmd(output_file, out_w, out_h, fps)
+    return FfmpegSink(cmd)
 
 
 def process_chunk(args: argparse.Namespace) -> Path:
@@ -319,140 +466,58 @@ def process_chunk(args: argparse.Namespace) -> Path:
     fps = float(cap.get(cv2.CAP_PROP_FPS)) or 29.97
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Invalid video dimensions ({width}x{height}) for {input_path}")
 
     recipe = None
     crop_box: tuple[int, int, int, int] = (0, height, 0, width)
     if args.quality_review:
-        from vhs24k.quality_review import (
-            apply_overscan_crop,
-            apply_post_upscale_4k_camera_polish,
-            apply_pre_upscale_color_and_lighting,
-            closed_loop_review_and_refine,
-            remove_vhs_white_line_dropouts,
-            save_comparison_and_report,
-            temporal_smooth_4k_frame,
-        )
-
         recipe, crop_box = _sample_chunk_metrics(input_path, total_frames, args.face_weight)
 
-    upsampler, face_enhancer = _init_upsampler(args)
-
     y0, y1, x0, x1 = crop_box
-    crop_w = x1 - x0
-    crop_h = y1 - y0
-    out_w, out_h = crop_w * 4, crop_h * 4
-    ffmpeg_proc = _open_ffmpeg_writer(output_file, out_w, out_h, fps)
-    if ffmpeg_proc.stdin is None:
-        raise RuntimeError("Failed to open FFmpeg stdin pipe.")
+    crop_w, crop_h = x1 - x0, y1 - y0
+    upsampler, face_enhancer = _init_upsampler(args, _effective_tile(args, crop_w, crop_h))
 
-    cap = cv2.VideoCapture(str(input_path))
-    rep_idx = min(15, max(0, total_frames // 2)) if total_frames > 0 else 0
-    reviewed = False
-    frame_idx = 0
-    total_dropouts_fixed = 0
-    prev_4k_frame: Any | None = None
+    from vhs24k.gpu_post import make_post_processor
 
-    def _read_cropped() -> Any | None:
-        ok, frm = cap.read()
-        if not ok or frm is None:
-            return None
-        if args.quality_review and recipe is not None:
-            return apply_overscan_crop(frm, crop_box)
-        return frm
+    post = make_post_processor(bool(args.gpu_post) and recipe is not None)
+    state: dict[str, Any] = {"recipe": recipe, "prev": None}
 
-    try:
-        prev_raw: Any | None = None
-        curr_raw = _read_cropped()
-        next_raw = _read_cropped() if curr_raw is not None else None
+    def face_weight() -> float:
+        current = state["recipe"]
+        return float(getattr(current, "face_weight", args.face_weight)) if current is not None else args.face_weight
 
-        while curr_raw is not None:
-            if args.quality_review and recipe is not None:
-                clean_raw, n_dropouts = remove_vhs_white_line_dropouts(
-                    curr_raw, prev_raw, next_raw
-                )
-                total_dropouts_fixed += n_dropouts
-                pre_frame = apply_pre_upscale_color_and_lighting(clean_raw, recipe)
-            else:
-                pre_frame = curr_raw
+    enhance = _make_enhance_fn(upsampler, face_enhancer, face_weight)
+    if recipe is not None:
+        state["recipe"] = _calibrate_recipe(
+            args, input_path, crop_box, recipe, total_frames, enhance, post, report_dir, (width, height)
+        )
 
-            if face_enhancer is not None:
-                weight = float(getattr(recipe, "face_weight", args.face_weight)) if recipe is not None else args.face_weight
-                _, _, upscaled_frame = face_enhancer.enhance(
-                    pre_frame,
-                    has_aligned=False,
-                    only_center_face=False,
-                    paste_back=True,
-                    weight=weight,
-                )
-            else:
-                upscaled_frame, _ = upsampler.enhance(pre_frame, outscale=4)
+    def enhance_and_polish(pre_frame: Any) -> Any:
+        upscaled = enhance(pre_frame)
+        if state["recipe"] is None:
+            return upscaled
+        polished = post.polish(upscaled, state["recipe"])
+        smoothed = post.temporal(polished, state["prev"], TEMPORAL_SMOOTH_STRENGTH)
+        state["prev"] = smoothed
+        return smoothed
 
-            if args.quality_review and recipe is not None:
-                post_frame = apply_post_upscale_4k_camera_polish(upscaled_frame, recipe)
-                if not reviewed and frame_idx >= rep_idx:
-                    (
-                        post_frame,
-                        before_metrics,
-                        after_metrics,
-                        recipe,
-                        was_refined,
-                    ) = closed_loop_review_and_refine(
-                        curr_raw,
-                        post_frame,
-                        recipe,
-                        target_score=args.target_quality_score,
-                    )
-                    saved = save_comparison_and_report(
-                        curr_raw,
-                        post_frame,
-                        before_metrics,
-                        after_metrics,
-                        recipe,
-                        report_dir,
-                        input_path.stem,
-                    )
-                    print(
-                        f"[Quality Review] {input_path.stem}: "
-                        f"Trimmed overscan: {width}x{height} -> {crop_w}x{crop_h} | "
-                        f"Before={before_metrics.overall_score:.1f}/100 -> "
-                        f"After={after_metrics.overall_score:.1f}/100 "
-                        f"({after_metrics.grade}) | "
-                        f"Auto-Refined={was_refined} | "
-                        f"Dropouts fixed={total_dropouts_fixed} px | "
-                        f"Report={saved.get('report_json')}",
-                        flush=True,
-                    )
-                    reviewed = True
-                post_frame = temporal_smooth_4k_frame(post_frame, prev_4k_frame, strength=0.48)
-                prev_4k_frame = post_frame
-            else:
-                post_frame = upscaled_frame
+    def to_bytes(frame: Any) -> bytes:
+        return post.to_numpy(frame).tobytes() if state["recipe"] is not None else frame.tobytes()
 
-            ffmpeg_proc.stdin.write(post_frame.tobytes())
-            prev_raw = curr_raw
-            curr_raw = next_raw
-            next_raw = _read_cropped() if curr_raw is not None else None
-            frame_idx += 1
-
-        ffmpeg_proc.stdin.close()
-        stderr_bytes = ffmpeg_proc.stderr.read() if ffmpeg_proc.stderr is not None else b""
-        rc = ffmpeg_proc.wait()
-        if rc != 0:
-            err_tail = stderr_bytes.decode("utf-8", errors="replace")[-1000:]
-            raise RuntimeError(f"FFmpeg writer failed (exit {rc}): {err_tail}")
-    finally:
-        cap.release()
-        if ffmpeg_proc.poll() is None:
-            ffmpeg_proc.kill()
-            ffmpeg_proc.wait()
+    stats = {"dropouts": 0}
+    sink = _open_sink(args, output_file, crop_w * 4, crop_h * 4, fps)
+    frames_done = run_pipeline(
+        _iter_prepared_frames(input_path, crop_box, state["recipe"], stats),
+        enhance_and_polish,
+        to_bytes,
+        sink,
+    )
 
     logger.info(
         "Processed %d frames (Dropouts fixed=%d px) -> %s",
-        frame_idx,
-        total_dropouts_fixed,
+        frames_done,
+        stats["dropouts"],
         output_file,
     )
     return output_file
