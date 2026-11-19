@@ -47,6 +47,29 @@ Per chunk, `vhs24k/frame_pipeline.py` runs three stages concurrently instead of 
 
 Disk: Kaggle's `/kaggle/working` is limited to about 20 GB. Preprocessed chunks, the final chunks, and the joined MP4 all live there. Process one source at a time (`--source-name VTS_01`, then `VTS_02`) and download each finished MP4 before starting the next.
 
+## Progress Monitoring
+
+Both the test clip and the full run print a progress line every ~15 seconds (and at every stage change), append it to `<work-dir>/progress.log`, and keep the latest state in `<work-dir>/progress.json` (includes `updated_at`):
+
+```
+[Progress 10:00:40] Overall 14.5% (472.86 MB of 3.19 GB source) | VTS_01 upscale 50.0% (chunk 14/30 done, 1.00 GB of 2.00 GB chunk data; 2 active) | elapsed 1:14:00 | ETA ~7:16:53
+```
+
+- **Overall %** is weighted by the size of the original source files (VOBs) and split into stages: prepare 5%, upscale 93%, assemble 2%. Preprocessing is estimated from the video time FFmpeg reports as processed.
+- **Upscale %** is weighted by the size of each prepared chunk file, with partial credit for chunks still running (workers write a small `*.progress.json` every 15 frames, removed when the chunk finishes).
+- **ETA** is extrapolated from the bytes processed this session, so it is rough early on and ignores work finished in earlier sessions.
+- **`WARNING: no progress for N min`** appears if chunks are running but nothing has advanced for 15 minutes.
+- In a test run (`--test-clip`) the overall % is by stage only (there is a single clip); byte counts show the chunk data.
+
+Check progress without touching the running job, including after a restart:
+
+```bash
+python -m vhs24k.cli status --work-dir /kaggle/working/work        # full run
+python -m vhs24k.cli status --work-dir /kaggle/working/work_test   # test clip
+```
+
+`status` only reads files (no GPU needed), shows percent and chunks per tape, and warns if the log has gone quiet for a long time.
+
 ## Kaggle `GPU T4 x2` Setup
 
 1. Open [notebooks/kaggle_vhs_to_4k.ipynb](notebooks/kaggle_vhs_to_4k.ipynb) in Kaggle.

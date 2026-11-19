@@ -109,12 +109,15 @@ def run_pipeline(
     to_bytes: Callable[[Any], bytes],
     sink: FfmpegSink,
     queue_depth: int = 6,
+    on_frame: Callable[[int], None] | None = None,
 ) -> int:
     """Run all stages to completion and return the number of frames written.
 
     ``prepared_frames`` is consumed in a background thread (CPU stage),
     ``enhance`` plus ``to_bytes`` run on the calling thread (GPU stage), and a
     writer thread feeds the encoder. The first error from any stage stops the rest.
+    ``on_frame(frames_written)`` is called from the writer thread after each frame
+    and must not raise.
     """
     stop = threading.Event()
     errors: list[BaseException] = []
@@ -148,6 +151,8 @@ def run_pipeline(
                     return
                 sink.write(item)
                 written[0] += 1
+                if on_frame is not None:
+                    on_frame(written[0])
         except BaseException as exc:  # noqa: BLE001
             fail(exc)
 

@@ -272,6 +272,7 @@ class TestWorkerEndToEnd:
         out = tmp_path / "up" / "chunk_0000.mp4"
         args = enhancer_worker.build_parser().parse_args(
             ["-i", str(chunk), "-o", str(out), "--report-dir", str(tmp_path / "up"),
+             "--progress-file", str(tmp_path / "up" / "chunk_0000.progress.json"),
              "--target-quality-score", "50", *extra]
         )
         return enhancer_worker.process_chunk(args), tiles
@@ -288,6 +289,11 @@ class TestWorkerEndToEnd:
         assert int(frames) == 50  # nothing dropped or duplicated by the pipeline
         assert _probe(result, "color_space")[0] == "bt709"
         assert tiles == [0], "SD frames must not be tiled"
+        # the worker reports frame progress for the parent's percent-complete display
+        from vhs24k.progress import read_chunk_progress
+
+        prog = read_chunk_progress(tmp_path / "up" / "chunk_0000.progress.json")
+        assert prog == {"frames_done": 45, "total_frames": 50}  # written every 15 frames
         # calibration review ran once up-front and left its evidence behind
         report = json.loads((tmp_path / "up" / "chunk_0000_quality_report.json").read_text(encoding="utf-8"))
         assert {"before", "after", "recipe"} <= report.keys()

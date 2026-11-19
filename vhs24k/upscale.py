@@ -17,6 +17,12 @@ from typing import Any
 from vhs24k.config import PipelineConfig
 from vhs24k.encoding import resolve_encoder
 from vhs24k.postprocess import _parse_dar, build_4k_scale_filter
+from vhs24k.progress import (
+    MONITOR_INTERVAL_SECONDS,
+    RunTracker,
+    chunk_progress_path,
+    snapshot_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +104,7 @@ def build_enhancer_worker_cmd(
     *,
     codec: str | None = None,
     scale_filter: str | None = None,
+    progress_file: Path | None = None,
 ) -> list[str]:
     """Build the ``vhs24k.enhancer_worker`` command for a video chunk.
 
@@ -135,6 +142,8 @@ def build_enhancer_worker_cmd(
         cmd.append("--no-gpu-post")
     if report_dir is not None:
         cmd.extend(["--report-dir", str(report_dir)])
+    if progress_file is not None:
+        cmd.extend(["--progress-file", str(progress_file)])
     if codec:
         cmd.extend(["--codec", codec, "--crf", str(cfg.crf), "--preset", cfg.chunk_preset])
         if scale_filter:
@@ -216,11 +225,14 @@ def _expected_realesrgan_output(chunk_input: Path, chunk_output: Path) -> Path:
     return chunk_output / f"{chunk_input.stem}_out{chunk_input.suffix}"
 
 
-def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
+def upscale_manifest(
+    manifest_path: Path, cfg: PipelineConfig, tracker: RunTracker | None = None
+) -> Path:
     """Upscale all pending chunks in ``manifest.json`` across available GPUs.
 
     Updates ``manifest.json`` atomically after each completed chunk so
-    interrupted sessions can resume cleanly.
+    interrupted sessions can resume cleanly. When a ``tracker`` is given, a
+    background monitor reports size-weighted percent complete while chunks run.
     """
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
@@ -240,6 +252,8 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
     ]
     if not pending_indices:
         logger.info("All %d chunks in %s are already done.", len(chunks), manifest_path)
+        if tracker is not None:
+            tracker.update_upscale(snapshot_chunks(chunks), force=True)
         return manifest_path
 
     if cfg.realesrgan_dir is None:
@@ -286,6 +300,7 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
         chunk_input, chunk_output = _resolve_chunk_io(chunk, cfg)
         chunk_output.mkdir(parents=True, exist_ok=True)
         expected_out = _expected_realesrgan_output(chunk_input, chunk_output)
+        progress_file = chunk_progress_path(chunk_input, chunk_output)
         if use_enhancer_worker:
             cmd = build_enhancer_worker_cmd(
                 chunk_input,
@@ -295,6 +310,7 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
                 report_dir=chunk_output,
                 codec=final_encode["codec"] if final_encode else None,
                 scale_filter=final_encode["scale_filter"] if final_encode else None,
+                progress_file=progress_file,
             )
         else:
             cmd = build_realesrgan_cmd(chunk_input, chunk_output, cfg, realesrgan_dir)
@@ -328,6 +344,7 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
                     chunk["status"] = "failed"
                     chunk["error"] = f"exit={proc.returncode}: {err_tail}"
                     _atomic_write_json(manifest_path, manifest_data)
+                    progress_file.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"Real-ESRGAN failed on {chunk_input.name} (exit {proc.returncode}): {err_tail}"
                 )
@@ -353,6 +370,7 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
                     chunk["final_encode"] = dict(final_encode)
                 else:
                     chunk.pop("final_encode", None)
+                progress_file.unlink(missing_ok=True)
                 if produced.exists():
                     chunk["upscaled_path"] = str(produced)
                     chunk["output_path"] = str(produced)
@@ -360,16 +378,47 @@ def upscale_manifest(manifest_path: Path, cfg: PipelineConfig) -> Path:
         finally:
             gpu_queue.put(gpu_id)
 
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_map = {
-            executor.submit(_process_chunk, idx): idx for idx in pending_indices
-        }
-        for future in as_completed(future_map):
-            idx = future_map[future]
-            try:
-                future.result()
-            except Exception as exc:
-                failures.append(f"chunk[{idx}]: {exc}")
+    if not cfg.dry_run:
+        # Leftovers from an interrupted run would be counted as progress and show as "active".
+        for idx in pending_indices:
+            stale_in, stale_out = _resolve_chunk_io(chunks[idx], cfg)
+            chunk_progress_path(stale_in, stale_out).unlink(missing_ok=True)
+
+    monitor_stop = threading.Event()
+
+    def _monitor() -> None:
+        """Report size-weighted progress until the upscale finishes."""
+        assert tracker is not None
+        while not monitor_stop.wait(MONITOR_INTERVAL_SECONDS):
+            with lock:
+                snapshot = snapshot_chunks(chunks)
+            tracker.update_upscale(snapshot)
+
+    monitor_thread: threading.Thread | None = None
+    if tracker is not None and not cfg.dry_run:
+        with lock:
+            tracker.update_upscale(snapshot_chunks(chunks), force=True)
+        monitor_thread = threading.Thread(target=_monitor, name="progress-monitor", daemon=True)
+        monitor_thread.start()
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_map = {
+                executor.submit(_process_chunk, idx): idx for idx in pending_indices
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    failures.append(f"chunk[{idx}]: {exc}")
+    finally:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=5)
+        if tracker is not None and not cfg.dry_run:
+            with lock:
+                tracker.update_upscale(snapshot_chunks(chunks), force=True)
 
     if failures:
         raise RuntimeError(

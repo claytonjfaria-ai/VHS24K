@@ -9,6 +9,7 @@ from pathlib import Path
 
 from vhs24k.config import PipelineConfig
 from vhs24k.encoding import EncoderSpec, build_encoder_spec, resolve_encoder
+from vhs24k.progress import RunTracker, format_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +159,27 @@ def _build_assemble_command(
     return cmd
 
 
-def assemble_final(manifest_path: Path, output_path: Path, cfg: PipelineConfig) -> Path:
+def assemble_final(
+    manifest_path: Path,
+    output_path: Path,
+    cfg: PipelineConfig,
+    tracker: RunTracker | None = None,
+) -> Path:
     """Concatenate upscaled chunks, apply 4K scale/pad filter, mux audio, and encode."""
     manifest_path = Path(manifest_path)
     output_path = Path(output_path)
+    if tracker is not None and not cfg.dry_run:
+        tracker.update_assemble(0.0)
+    result = _assemble_final(manifest_path, output_path, cfg)
+    if tracker is not None and not cfg.dry_run:
+        size = f" ({format_bytes(result.stat().st_size)})" if result.exists() else ""
+        tracker.update_assemble(1.0)
+        logger.info("Assembled %s%s", result, size)
+    return result
+
+
+def _assemble_final(manifest_path: Path, output_path: Path, cfg: PipelineConfig) -> Path:
+    """Join (or re-encode) the chunks; see ``assemble_final``."""
 
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import math
 import re
 import subprocess
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from vhs24k.config import PipelineConfig
+from vhs24k.progress import RunTracker
 
 MIN_SOURCE_BYTES = 1_000_000  # 1 MB threshold to skip menu/stub/corrupt files
 _VOB_TITLE_RE = re.compile(r"^VTS_(\d+)_(\d+)\.vob$", re.IGNORECASE)
@@ -310,13 +313,73 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         ) from exc
 
 
-def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> Path:
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    total_seconds: float | None,
+    on_fraction: Callable[[float], None],
+) -> None:
+    """Run FFmpeg (started with ``-progress pipe:1``), reporting the fraction of video processed.
+
+    ``stderr`` is drained on a thread so a chatty FFmpeg can never block on a full pipe.
+    """
+    proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    stderr_tail: collections.deque[str] = collections.deque(maxlen=40)
+    drain = threading.Thread(
+        target=lambda: [stderr_tail.append(line) for line in proc.stderr or ()], daemon=True
+    )
+    drain.start()
+    try:
+        for line in proc.stdout or ():
+            key, _, value = line.strip().partition("=")
+            if key not in ("out_time_us", "out_time_ms") or not total_seconds:
+                continue
+            try:
+                seconds = int(value) / 1_000_000.0  # both keys are microseconds in FFmpeg output
+            except ValueError:
+                continue
+            on_fraction(min(1.0, max(0.0, seconds / total_seconds)))
+    except BaseException:
+        proc.kill()  # nobody reads stdout any more; a live FFmpeg would block forever
+        raise
+    finally:
+        rc = proc.wait()
+        drain.join(timeout=5)
+    if rc != 0:
+        raise RuntimeError(
+            f"FFmpeg command failed ({' '.join(cmd)}): {''.join(stderr_tail).strip()}"
+        )
+
+
+def _expected_video_seconds(source: SourceGroup, cfg: PipelineConfig) -> float | None:
+    """Length of video that preprocessing will read, for progress percentages."""
+    if cfg.test_clip_seconds is not None:
+        return float(cfg.test_clip_seconds)
+    total = 0.0
+    for path in source.files:
+        try:
+            duration = probe_video(path).duration
+        except (FileNotFoundError, RuntimeError, ValueError):
+            return None
+        if not duration or duration <= 0:
+            return None
+        total += duration
+    return total or None
+
+
+def prepare_chunks(
+    source: SourceGroup,
+    work_dir: Path,
+    cfg: PipelineConfig,
+    tracker: RunTracker | None = None,
+) -> Path:
     """Preprocess a SourceGroup into segmented video chunks and extracted audio.
 
     Writes and returns the path to ``manifest.json`` inside ``work_dir / source.name``.
     If already prepared and all artifacts exist, returns immediately.
     When ``cfg.dry_run`` is True, writes planned commands into ``manifest.json``
-    without executing FFmpeg.
+    without executing FFmpeg. A ``tracker`` receives the fraction of video processed.
     """
     work_dir = Path(work_dir)
     source_dir = work_dir / source.name
@@ -325,6 +388,8 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
     manifest_path = source_dir / "manifest.json"
 
     if not cfg.dry_run and _is_manifest_prepared(manifest_path, cfg):
+        if tracker is not None:
+            tracker.update_prepare(1.0, force=True)
         return manifest_path
 
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -406,9 +471,16 @@ def prepare_chunks(source: SourceGroup, work_dir: Path, cfg: PipelineConfig) -> 
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return manifest_path
 
-    _run_ffmpeg(video_cmd)
+    if tracker is not None:
+        tracker.update_prepare(0.0, force=True)
+        progress_cmd = [video_cmd[0], "-progress", "pipe:1", "-nostats", *video_cmd[1:]]
+        _run_ffmpeg_with_progress(progress_cmd, _expected_video_seconds(source, cfg), tracker.update_prepare)
+    else:
+        _run_ffmpeg(video_cmd)
     if audio_cmd is not None:
         _run_ffmpeg(audio_cmd)
+    if tracker is not None:
+        tracker.update_prepare(1.0, force=True)
 
     chunk_files = sorted(chunks_dir.glob("chunk_*.mp4"))
     if not chunk_files:

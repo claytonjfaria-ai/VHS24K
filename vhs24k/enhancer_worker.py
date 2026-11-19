@@ -18,6 +18,7 @@ from vhs24k.encoding import (
     resolve_encoder,
 )
 from vhs24k.frame_pipeline import FfmpegSink, run_pipeline
+from vhs24k.progress import FRAME_REPORT_INTERVAL, write_chunk_progress
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--crf", type=int, default=17, help="Encoder quality (CRF/CQ base, default: 17).")
     parser.add_argument("--preset", default="auto", help="Encoder preset (default: auto per codec).")
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        default=None,
+        help="Write frame progress here every few frames so the parent can report percent complete.",
+    )
     parser.add_argument(
         "--scale-filter",
         default=None,
@@ -505,6 +512,13 @@ def process_chunk(args: argparse.Namespace) -> Path:
     def to_bytes(frame: Any) -> bytes:
         return post.to_numpy(frame).tobytes() if state["recipe"] is not None else frame.tobytes()
 
+    progress_file = Path(args.progress_file) if args.progress_file else None
+
+    def report_progress(frames_written: int) -> None:
+        if frames_written % FRAME_REPORT_INTERVAL == 0:
+            write_chunk_progress(progress_file, frames_written, total_frames)
+
+    write_chunk_progress(progress_file, 0, total_frames)
     stats = {"dropouts": 0}
     sink = _open_sink(args, output_file, crop_w * 4, crop_h * 4, fps)
     frames_done = run_pipeline(
@@ -512,6 +526,7 @@ def process_chunk(args: argparse.Namespace) -> Path:
         enhance_and_polish,
         to_bytes,
         sink,
+        on_frame=report_progress,
     )
 
     logger.info(

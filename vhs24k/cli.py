@@ -13,6 +13,7 @@ from vhs24k.config import PipelineConfig
 from vhs24k.drive_io import download_wedding_files
 from vhs24k.postprocess import assemble_final
 from vhs24k.preprocess import discover_sources, prepare_chunks, probe_video
+from vhs24k.progress import RunTracker, describe_work_dir, format_bytes
 from vhs24k.upscale import upscale_manifest
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("upscale", "Upscale prepared chunks across available GPUs."),
         ("assemble", "Scale upscaled chunks to 4K and mux original audio."),
         ("run", "Run prepare -> upscale -> assemble end-to-end."),
+        ("status", "Show percent complete from the work directory (reads files only)."),
     ):
         sub = subparsers.add_parser(name, help=help_text)
         _add_common_flags(sub)
@@ -257,28 +259,79 @@ def _filter_sources(sources: list, cfg: PipelineConfig) -> list:
     return sources
 
 
+def _new_tracker(cfg: PipelineConfig, source_bytes: dict[str, int]) -> RunTracker | None:
+    """Progress tracker weighted by source file size (a test clip is weighted by stage only)."""
+    if cfg.dry_run:
+        return None
+    if cfg.test_clip_seconds is not None:
+        return RunTracker(cfg.work_dir, {name: 1 for name in source_bytes}, show_source_bytes=False)
+    return RunTracker(cfg.work_dir, source_bytes)
+
+
+def _manifest_source_bytes(manifest_path: Path) -> int:
+    """Total size of the original source files recorded in a manifest."""
+    try:
+        files = json.loads(manifest_path.read_text(encoding="utf-8")).get("source_files", [])
+    except (OSError, ValueError, AttributeError):
+        return 0
+    total = 0
+    for name in files:
+        try:
+            total += Path(name).stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _manifest_tracker(cfg: PipelineConfig, manifests: list[Path]) -> RunTracker | None:
+    return _new_tracker(cfg, {m.parent.name: _manifest_source_bytes(m) for m in manifests})
+
+
 def _cmd_prepare(cfg: PipelineConfig) -> int:
     sources = _filter_sources(discover_sources(cfg.input_dir, cfg.source_mode), cfg)
+    tracker = _new_tracker(cfg, {s.name: sum(p.stat().st_size for p in s.files) for s in sources})
     for src in sources:
-        manifest_path = prepare_chunks(src, cfg.work_dir, cfg)
+        if tracker is not None:
+            tracker.begin_source(src.name)
+        manifest_path = prepare_chunks(src, cfg.work_dir, cfg, tracker)
+        if tracker is not None:
+            tracker.finish_source("prepare")
         print(f"Prepared: {manifest_path}")
+    if tracker is not None:
+        tracker.close("Prepare finished")
     return 0
 
 
 def _cmd_upscale(cfg: PipelineConfig) -> int:
-    for manifest_path in _find_manifests(cfg):
-        upscale_manifest(manifest_path, cfg)
+    manifests = _find_manifests(cfg)
+    tracker = _manifest_tracker(cfg, manifests)
+    for manifest_path in manifests:
+        if tracker is not None:
+            tracker.begin_source(manifest_path.parent.name)
+        upscale_manifest(manifest_path, cfg, tracker)
+        if tracker is not None:
+            tracker.finish_source("upscale")
         print(f"Upscaled: {manifest_path}")
+    if tracker is not None:
+        tracker.close("Upscale finished")
     return 0
 
 
 def _cmd_assemble(cfg: PipelineConfig) -> int:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    for manifest_path in _find_manifests(cfg):
+    manifests = _find_manifests(cfg)
+    tracker = _manifest_tracker(cfg, manifests)
+    for manifest_path in manifests:
         suffix = "_test_4k.mp4" if cfg.test_clip_seconds is not None else "_4k.mp4"
         out_path = cfg.output_dir / f"{manifest_path.parent.name}{suffix}"
-        result = assemble_final(manifest_path, out_path, cfg)
+        if tracker is not None:
+            tracker.begin_source(manifest_path.parent.name)
+        result = assemble_final(manifest_path, out_path, cfg, tracker)
+        if tracker is not None:
+            tracker.finish_source("assemble")
         print(f"Assembled: {result}")
+    if tracker is not None:
+        tracker.close()
     return 0
 
 
@@ -290,13 +343,31 @@ def _cmd_run(cfg: PipelineConfig) -> int:
         vts02 = [s for s in sources if s.name.lower() == "vts_02"]
         sources = vts02 if vts02 else sources[:1]
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    tracker = _new_tracker(cfg, {s.name: sum(p.stat().st_size for p in s.files) for s in sources})
     for src in sources:
-        manifest_path = prepare_chunks(src, cfg.work_dir, cfg)
-        upscale_manifest(manifest_path, cfg)
+        if tracker is not None:
+            tracker.begin_source(src.name)
+        manifest_path = prepare_chunks(src, cfg.work_dir, cfg, tracker)
+        upscale_manifest(manifest_path, cfg, tracker)
         suffix = "_test_4k.mp4" if cfg.test_clip_seconds is not None else "_4k.mp4"
         out_path = cfg.output_dir / f"{src.name}{suffix}"
-        result = assemble_final(manifest_path, out_path, cfg)
-        print(f"Completed {src.name}: {result}")
+        result = assemble_final(manifest_path, out_path, cfg, tracker)
+        if tracker is not None:
+            tracker.finish_source()
+        size = f" ({format_bytes(result.stat().st_size)})" if result.exists() else ""
+        print(f"Completed {src.name}: {result}{size}")
+    if tracker is not None:
+        tracker.close()
+    return 0
+
+
+def _cmd_status(cfg: PipelineConfig) -> int:
+    manifests = sorted(cfg.work_dir.glob("*/manifest.json"))
+    if not manifests:
+        print(f"No manifest.json files found in {cfg.work_dir}. Nothing has been prepared yet.")
+        return 1
+    for line in describe_work_dir(cfg.work_dir, manifests):
+        print(line)
     return 0
 
 
@@ -329,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
         "upscale": lambda: _cmd_upscale(cfg),
         "assemble": lambda: _cmd_assemble(cfg),
         "run": lambda: _cmd_run(cfg),
+        "status": lambda: _cmd_status(cfg),
         "download": lambda: _cmd_download(args, cfg),
     }
     return handlers[args.command]()
