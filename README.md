@@ -107,11 +107,12 @@ python -m vhs24k.cli run \
   --work-dir /kaggle/working/work \
   --output-dir /kaggle/working/output \
   --realesrgan-dir /kaggle/working/Real-ESRGAN \
+  --source-name VTS_01 \
   --test-clip 60 \
   --test-start 900
 ```
 
-This takes 60 seconds starting 900 s (15 minutes) into the source (`-ss 900 -t 60`) and outputs `<source_name>_test_4k.mp4`. Use `--source-name VTS_01` or `VTS_02` to pick the title; with no name, the test uses VTS_02. Once satisfied with the visual quality, remove `--test-clip 60 --test-start 900` (and clear the test `work/` directory) to run the full tapes.
+This takes 60 seconds starting 900 s (15 minutes) into the source (`-ss 900 -t 60`) and outputs `<source_name>_test_4k.mp4`. The ceremony is on VTS_01, so the example names it; use `--source-name VTS_02` for the other title. With no name, the test falls back to VTS_02. Once satisfied with the visual quality, remove `--test-clip 60 --test-start 900` (and clear the test `work/` directory) to run the full tapes.
 
 ## 12-Hour Session Resume Behavior
 
